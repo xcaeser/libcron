@@ -43,12 +43,28 @@ pub const JobOptions = struct {
     overlap: OverlapPolicy = .skip,
 };
 
+/// What happened to one invocation. Durations are elapsed wall-clock time.
 pub const Outcome = union(enum) {
-    callback_success,
-    callback_error: anyerror,
-    command_terminated: std.process.Child.Term,
+    callback_success: std.Io.Duration,
+    callback_error: struct { err: anyerror, duration: std.Io.Duration },
+    command_terminated: struct { term: std.process.Child.Term, duration: std.Io.Duration },
+    /// The command could not be spawned or waited for.
     command_error: anyerror,
     skipped_overlap,
+    /// The `Io` could not start the task; the job runs again at its next match.
+    dispatch_error: std.Io.ConcurrentError,
+
+    /// Describes the outcome for a log line, as in `exited with code 0 after 1.5s`.
+    pub fn format(self: Outcome, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        switch (self) {
+            .callback_success => |duration| try writer.print("succeeded after {f}", .{duration}),
+            .callback_error => |failure| try writer.print("failed after {f}: {t}", .{ failure.duration, failure.err }),
+            .command_terminated => |finished| try writer.print("{f} after {f}", .{ finished.term, finished.duration }),
+            .command_error => |err| try writer.print("could not run: {t}", .{err}),
+            .skipped_overlap => try writer.writeAll("skipped: the previous run is still active"),
+            .dispatch_error => |err| try writer.print("not started: {t}", .{err}),
+        }
+    }
 };
 
 /// Receives results from scheduler and job tasks and therefore must be
@@ -64,7 +80,8 @@ pub const AddError = std.mem.Allocator.Error || error{
     JobIdExhausted,
 };
 
-pub const RunError = std.Io.Cancelable || std.Io.ConcurrentError || TimeZoneError || error{
+/// Only cancellation ends a running scheduler; job failures go to the observer.
+pub const RunError = std.Io.Cancelable || error{
     AlreadyRunning,
 };
 
@@ -160,7 +177,7 @@ pub const Scheduler = struct {
         while (true) {
             const step = tick(std.Io.Clock.real.now(io).nanoseconds, last_minute);
             if (step.due_minute) |minute| {
-                try self.dispatchMinute(io, &jobs, minute, observer);
+                self.dispatchMinute(io, &jobs, minute, observer);
                 last_minute = minute;
             }
             const deadline: std.Io.Clock.Timestamp = .{
@@ -177,10 +194,11 @@ pub const Scheduler = struct {
         group: *std.Io.Group,
         unix_minute: i64,
         observer: ?Observer,
-    ) RunError!void {
-        const unix_seconds = std.math.mul(i64, unix_minute, 60) catch return error.DateOutOfRange;
+    ) void {
+        // Only instants outside the years 1 through 65535 fail to convert.
+        const unix_seconds = std.math.mul(i64, unix_minute, 60) catch return;
         for (self.jobs.items) |*job| {
-            const local_time = try job.options.time_zone.toLocal(unix_seconds);
+            const local_time = job.options.time_zone.toLocal(unix_seconds) catch continue;
             if (!job.due(local_time)) continue;
 
             const invocation: Invocation = .{
@@ -196,7 +214,7 @@ pub const Scheduler = struct {
 
             group.concurrent(io, executeJob, .{ job, io, invocation, observer }) catch |err| {
                 if (tracks_overlap) job.active.store(false, .release);
-                return err;
+                report(observer, invocation, .{ .dispatch_error = err });
             };
         }
     }
@@ -269,15 +287,19 @@ fn executeJob(
     observer: ?Observer,
 ) std.Io.Cancelable!void {
     defer if (job.options.overlap == .skip) job.active.store(false, .release);
+    const started = std.Io.Clock.Timestamp.now(io, .boot);
 
     switch (job.task) {
         .callback => |callback| {
             callback.run(callback.context, io, invocation) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
-                report(observer, invocation, .{ .callback_error = err });
+                report(observer, invocation, .{ .callback_error = .{
+                    .err = err,
+                    .duration = started.untilNow(io).raw,
+                } });
                 return;
             };
-            report(observer, invocation, .callback_success);
+            report(observer, invocation, .{ .callback_success = started.untilNow(io).raw });
         },
         .command => |command| {
             const previous_cancel_protection = io.swapCancelProtection(.blocked);
@@ -307,7 +329,10 @@ fn executeJob(
                 return;
             };
             kill_child.id = null;
-            report(observer, invocation, .{ .command_terminated = term });
+            report(observer, invocation, .{ .command_terminated = .{
+                .term = term,
+                .duration = started.untilNow(io).raw,
+            } });
         },
     }
 }
@@ -322,6 +347,7 @@ const TestOutcomes = struct {
     callback_error: std.atomic.Value(u32) = .init(0),
     skipped_overlap: std.atomic.Value(u32) = .init(0),
     command_exit: std.atomic.Value(i32) = .init(-1),
+    dispatch_error: std.atomic.Value(u32) = .init(0),
     last_success_minute: std.atomic.Value(i64) = .init(0),
 
     fn notify(context: ?*anyopaque, invocation: Invocation, outcome: Outcome) void {
@@ -333,11 +359,12 @@ const TestOutcomes = struct {
             },
             .callback_error => _ = self.callback_error.fetchAdd(1, .monotonic),
             .skipped_overlap => _ = self.skipped_overlap.fetchAdd(1, .monotonic),
-            .command_terminated => |term| switch (term) {
+            .command_terminated => |finished| switch (finished.term) {
                 .exited => |code| self.command_exit.store(code, .monotonic),
                 else => self.command_exit.store(-2, .monotonic),
             },
             .command_error => self.command_exit.store(-3, .monotonic),
+            .dispatch_error => _ = self.dispatch_error.fetchAdd(1, .monotonic),
         }
     }
 
@@ -379,7 +406,7 @@ const TestClock = struct {
     fn dispatch(self: *TestClock, unix_minute: i64) !void {
         var group: std.Io.Group = .init;
         defer group.cancel(std.testing.io);
-        try self.scheduler.dispatchMinute(std.testing.io, &group, unix_minute, self.outcomes.observer());
+        self.scheduler.dispatchMinute(std.testing.io, &group, unix_minute, self.outcomes.observer());
         try group.await(std.testing.io);
     }
 
@@ -557,7 +584,7 @@ test "scheduler lifecycle and single-minute callback dispatch" {
     var outcomes: TestOutcomes = .{};
     var group: std.Io.Group = .init;
     defer group.cancel(std.testing.io);
-    try scheduler.dispatchMinute(std.testing.io, &group, 0, outcomes.observer());
+    scheduler.dispatchMinute(std.testing.io, &group, 0, outcomes.observer());
     try group.await(std.testing.io);
     try std.testing.expectEqual(1, outcomes.callback_success.load(.monotonic));
     try std.testing.expectEqual(1, outcomes.callback_error.load(.monotonic));
@@ -579,8 +606,8 @@ test "scheduler applies overlap policies and cancellation cleanup" {
     var skipped_outcomes: TestOutcomes = .{};
     var skipped_group: std.Io.Group = .init;
     defer skipped_group.cancel(std.testing.io);
-    try skipped.dispatchMinute(std.testing.io, &skipped_group, 0, skipped_outcomes.observer());
-    try skipped.dispatchMinute(std.testing.io, &skipped_group, 1, skipped_outcomes.observer());
+    skipped.dispatchMinute(std.testing.io, &skipped_group, 0, skipped_outcomes.observer());
+    skipped.dispatchMinute(std.testing.io, &skipped_group, 1, skipped_outcomes.observer());
     try skipped_group.await(std.testing.io);
     try std.testing.expectEqual(1, skipped_outcomes.callback_success.load(.monotonic));
     try std.testing.expectEqual(1, skipped_outcomes.skipped_overlap.load(.monotonic));
@@ -595,8 +622,8 @@ test "scheduler applies overlap policies and cancellation cleanup" {
     var concurrent_outcomes: TestOutcomes = .{};
     var concurrent_group: std.Io.Group = .init;
     defer concurrent_group.cancel(std.testing.io);
-    try concurrent.dispatchMinute(std.testing.io, &concurrent_group, 0, concurrent_outcomes.observer());
-    try concurrent.dispatchMinute(std.testing.io, &concurrent_group, 1, concurrent_outcomes.observer());
+    concurrent.dispatchMinute(std.testing.io, &concurrent_group, 0, concurrent_outcomes.observer());
+    concurrent.dispatchMinute(std.testing.io, &concurrent_group, 1, concurrent_outcomes.observer());
     try concurrent_group.await(std.testing.io);
     try std.testing.expectEqual(2, concurrent_outcomes.callback_success.load(.monotonic));
 
@@ -608,7 +635,7 @@ test "scheduler applies overlap policies and cancellation cleanup" {
         .{},
     );
     var canceled_group: std.Io.Group = .init;
-    try canceled.dispatchMinute(std.testing.io, &canceled_group, 0, null);
+    canceled.dispatchMinute(std.testing.io, &canceled_group, 0, null);
     try std.testing.expect(canceled.jobs.items[0].active.load(.acquire));
     canceled_group.cancel(std.testing.io);
     try std.testing.expect(!canceled.jobs.items[0].active.load(.acquire));
@@ -636,7 +663,7 @@ test "scheduler reports child process termination" {
     var outcomes: TestOutcomes = .{};
     var group: std.Io.Group = .init;
     defer group.cancel(std.testing.io);
-    try scheduler.dispatchMinute(std.testing.io, &group, 0, outcomes.observer());
+    scheduler.dispatchMinute(std.testing.io, &group, 0, outcomes.observer());
     try group.await(std.testing.io);
     try std.testing.expectEqual(7, outcomes.command_exit.load(.monotonic));
 }
@@ -676,7 +703,7 @@ test "scheduler cancellation cleans up a running child command" {
     var outcomes: TestOutcomes = .{};
     var group: std.Io.Group = .init;
     defer group.cancel(std.testing.io);
-    try scheduler.dispatchMinute(std.testing.io, &group, 0, outcomes.observer());
+    scheduler.dispatchMinute(std.testing.io, &group, 0, outcomes.observer());
     try std.testing.expect(scheduler.jobs.items[0].active.load(.acquire));
 
     var child_started = false;
@@ -695,4 +722,42 @@ test "scheduler cancellation cleans up a running child command" {
     group.cancel(std.testing.io);
     try std.testing.expect(!scheduler.jobs.items[0].active.load(.acquire));
     try std.testing.expectEqual(-1, outcomes.command_exit.load(.monotonic));
+}
+
+test "dispatch errors are reported and the job runs at its next match" {
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    const every_minute = try Expression.parse("* * * * *");
+    for (0..2) |_| _ = try scheduler.add(every_minute, .{ .callback = .{ .run = successfulTestCallback } }, .{});
+
+    var outcomes: TestOutcomes = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(std.testing.io);
+    scheduler.dispatchMinute(std.Io.failing, &group, 0, outcomes.observer());
+    try std.testing.expectEqual(2, outcomes.dispatch_error.load(.monotonic));
+
+    scheduler.dispatchMinute(std.testing.io, &group, 1, outcomes.observer());
+    try group.await(std.testing.io);
+    try std.testing.expectEqual(2, outcomes.callback_success.load(.monotonic));
+}
+
+test "outcomes describe themselves for log lines" {
+    const cases = [_]struct { outcome: Outcome, text: []const u8 }{
+        .{ .outcome = .{ .callback_success = .fromMilliseconds(1_500) }, .text = "succeeded after 1.5s" },
+        .{
+            .outcome = .{ .callback_error = .{ .err = error.Timeout, .duration = .fromSeconds(2) } },
+            .text = "failed after 2s: Timeout",
+        },
+        .{
+            .outcome = .{ .command_terminated = .{ .term = .{ .exited = 7 }, .duration = .fromSeconds(90) } },
+            .text = "exited with code 7 after 1m30s",
+        },
+        .{ .outcome = .{ .command_error = error.FileNotFound }, .text = "could not run: FileNotFound" },
+        .{ .outcome = .skipped_overlap, .text = "skipped: the previous run is still active" },
+        .{ .outcome = .{ .dispatch_error = error.ConcurrencyUnavailable }, .text = "not started: ConcurrencyUnavailable" },
+    };
+    for (cases) |case| {
+        var buffer: [128]u8 = undefined;
+        try std.testing.expectEqualStrings(case.text, try std.fmt.bufPrint(&buffer, "{f}", .{case.outcome}));
+    }
 }
