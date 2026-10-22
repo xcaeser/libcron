@@ -150,23 +150,24 @@ pub const Scheduler = struct {
         self.running = true;
         defer self.running = false;
 
+        // Minutes that passed while stopped are not caught up.
+        for (self.jobs.items) |*job| job.wall_time = null;
+
         var jobs: std.Io.Group = .init;
         defer jobs.cancel(io);
 
-        const minute_ns: i96 = std.time.ns_per_min;
+        var last_minute = unixMinute(std.Io.Clock.real.now(io).nanoseconds);
         while (true) {
-            const now = std.Io.Clock.real.now(io);
-            const deadline_ns = (@divFloor(now.nanoseconds, minute_ns) + 1) * minute_ns;
+            const step = tick(std.Io.Clock.real.now(io).nanoseconds, last_minute);
+            if (step.due_minute) |minute| {
+                try self.dispatchMinute(io, &jobs, minute, observer);
+                last_minute = minute;
+            }
             const deadline: std.Io.Clock.Timestamp = .{
-                .raw = .{ .nanoseconds = deadline_ns },
+                .raw = .{ .nanoseconds = step.deadline_ns },
                 .clock = .real,
             };
             try deadline.wait(io);
-
-            const current = std.Io.Clock.real.now(io);
-            const unix_minute = std.math.cast(i64, @divFloor(current.nanoseconds, minute_ns)) orelse
-                return error.DateOutOfRange;
-            try self.dispatchMinute(io, &jobs, unix_minute, observer);
         }
     }
 
@@ -180,7 +181,7 @@ pub const Scheduler = struct {
         const unix_seconds = std.math.mul(i64, unix_minute, 60) catch return error.DateOutOfRange;
         for (self.jobs.items) |*job| {
             const local_time = try job.options.time_zone.toLocal(unix_seconds);
-            if (!(job.expression.matches(local_time) catch unreachable)) continue;
+            if (!job.due(local_time)) continue;
 
             const invocation: Invocation = .{
                 .job_id = job.id,
@@ -207,7 +208,59 @@ const Job = struct {
     task: Task,
     options: JobOptions,
     active: std.atomic.Value(bool),
+    /// The latest wall-clock minute dispatched. It does not move back while
+    /// the wall clock repeats after a DST change.
+    wall_time: ?DateTime = null,
+
+    /// Applies cronie's rules for wall-clock steps. When the wall clock
+    /// repeats, only jobs with a `*` minute or hour run again. When it jumps
+    /// ahead by less than three hours (spring-forward, late wake), a
+    /// fixed-time job that matched any skipped minute runs once. Larger steps
+    /// either way are taken as the new time without catching up.
+    fn due(self: *Job, local: DateTime) bool {
+        const expression = self.expression;
+        const matches = expression.matches(local) catch unreachable;
+        const previous = self.wall_time orelse {
+            self.wall_time = local;
+            return matches;
+        };
+        const step = calendar.epochMinute(local) - calendar.epochMinute(previous);
+        const wildcard = expression.minute_star or expression.hour_star;
+        if (step <= 0 and step > -max_catch_up_minutes) return wildcard and matches;
+
+        self.wall_time = local;
+        if (step == 1 or wildcard or @abs(step) >= max_catch_up_minutes) return matches;
+        const skipped = (expression.next(previous) catch unreachable) orelse return false;
+        return calendar.epochMinute(skipped) <= calendar.epochMinute(local);
+    }
 };
+
+const max_catch_up_minutes = 3 * 60;
+
+fn unixMinute(unix_nanoseconds: i96) i64 {
+    return @intCast(@divFloor(unix_nanoseconds, std.time.ns_per_min));
+}
+
+const Tick = struct {
+    due_minute: ?i64,
+    deadline_ns: i96,
+};
+
+/// Decides what the run loop does after reading the real clock: which unix
+/// minute to dispatch, if any, and when to read the clock again. A minute at
+/// or before `last_minute` is never dispatched again, so a wall clock stepped
+/// back, or a relative sleep that outlasts such a step, cannot rerun jobs. A
+/// step back of three hours or more is taken as the new time instead of
+/// leaving the scheduler idle until the clock catches up.
+fn tick(now_ns: i96, last_minute: i64) Tick {
+    const minute = unixMinute(now_ns);
+    const due = minute > last_minute or last_minute - minute >= max_catch_up_minutes;
+    const wake_minute = if (due) minute + 1 else last_minute + 1;
+    return .{
+        .due_minute = if (due) minute else null,
+        .deadline_ns = @as(i96, wake_minute) * std.time.ns_per_min,
+    };
+}
 
 fn executeJob(
     job: *Job,
@@ -269,12 +322,15 @@ const TestOutcomes = struct {
     callback_error: std.atomic.Value(u32) = .init(0),
     skipped_overlap: std.atomic.Value(u32) = .init(0),
     command_exit: std.atomic.Value(i32) = .init(-1),
+    last_success_minute: std.atomic.Value(i64) = .init(0),
 
     fn notify(context: ?*anyopaque, invocation: Invocation, outcome: Outcome) void {
-        _ = invocation;
         const self: *TestOutcomes = @ptrCast(@alignCast(context.?));
         switch (outcome) {
-            .callback_success => _ = self.callback_success.fetchAdd(1, .monotonic),
+            .callback_success => {
+                _ = self.callback_success.fetchAdd(1, .monotonic);
+                self.last_success_minute.store(invocation.scheduled_unix_minute, .monotonic);
+            },
             .callback_error => _ = self.callback_error.fetchAdd(1, .monotonic),
             .skipped_overlap => _ = self.skipped_overlap.fetchAdd(1, .monotonic),
             .command_terminated => |term| switch (term) {
@@ -298,6 +354,156 @@ fn failingTestCallback(_: ?*anyopaque, _: std.Io, _: Invocation) anyerror!void {
 
 fn blockingTestCallback(_: ?*anyopaque, io: std.Io, _: Invocation) anyerror!void {
     try std.Io.sleep(io, .fromSeconds(60), .awake);
+}
+
+/// Dispatches minutes one at a time to a single callback job.
+const TestClock = struct {
+    scheduler: Scheduler,
+    outcomes: TestOutcomes = .{},
+
+    fn init(schedule: []const u8, zone: TimeZone) !TestClock {
+        var scheduler = Scheduler.init(std.testing.allocator);
+        errdefer scheduler.deinit();
+        _ = try scheduler.add(
+            try Expression.parse(schedule),
+            .{ .callback = .{ .run = successfulTestCallback } },
+            .{ .time_zone = zone },
+        );
+        return .{ .scheduler = scheduler };
+    }
+
+    fn deinit(self: *TestClock) void {
+        self.scheduler.deinit();
+    }
+
+    fn dispatch(self: *TestClock, unix_minute: i64) !void {
+        var group: std.Io.Group = .init;
+        defer group.cancel(std.testing.io);
+        try self.scheduler.dispatchMinute(std.testing.io, &group, unix_minute, self.outcomes.observer());
+        try group.await(std.testing.io);
+    }
+
+    fn dispatchRange(self: *TestClock, first: i64, end: i64) !void {
+        var minute = first;
+        while (minute < end) : (minute += 1) try self.dispatch(minute);
+    }
+
+    fn fired(self: *TestClock) u32 {
+        return self.outcomes.callback_success.load(.monotonic);
+    }
+};
+
+fn utcMinute(year: u16, month: calendar.Month, day: u8, hour: u8, minute: u8) i64 {
+    return calendar.epochMinute(.{ .year = year, .month = month, .day = day, .hour = hour, .minute = minute });
+}
+
+fn footerTz(footer: []const u8) std.Tz {
+    return .{
+        .allocator = std.testing.allocator,
+        .transitions = &.{},
+        .timetypes = &.{.{ .offset = 0, .flags = 0, .name_data = .{ 'S', 'T', 'D', 0, 0, 0 } }},
+        .leapseconds = &.{},
+        .footer = footer,
+    };
+}
+
+test "run loop never dispatches a minute twice when the wall clock steps back" {
+    const minute_ns: i96 = std.time.ns_per_min;
+    const last: i64 = 29_000_000;
+    try std.testing.expectEqual(
+        Tick{ .due_minute = last + 1, .deadline_ns = (last + 2) * minute_ns },
+        tick((last + 1) * minute_ns + 5, last),
+    );
+    try std.testing.expectEqual(
+        Tick{ .due_minute = null, .deadline_ns = (last + 1) * minute_ns },
+        tick(last * minute_ns + 30 * std.time.ns_per_s, last),
+    );
+    try std.testing.expectEqual(
+        Tick{ .due_minute = null, .deadline_ns = (last + 1) * minute_ns },
+        tick((last - 10) * minute_ns, last),
+    );
+    try std.testing.expectEqual(
+        Tick{ .due_minute = last + 90, .deadline_ns = (last + 91) * minute_ns },
+        tick((last + 90) * minute_ns, last),
+    );
+    try std.testing.expectEqual(
+        Tick{ .due_minute = last - 180, .deadline_ns = (last - 179) * minute_ns },
+        tick((last - 180) * minute_ns, last),
+    );
+    try std.testing.expectEqual(-1, unixMinute(-1));
+}
+
+test "fixed-time jobs run once and wildcard jobs every real quarter hour across DST" {
+    const Transition = struct {
+        schedule: []const u8,
+        /// The UTC minute the fixed-time job must run at.
+        expected: i64,
+    };
+    const cases = [_]struct { footer: []const u8, spring: Transition, fall: Transition }{
+        .{
+            .footer = "CET-1CEST,M3.5.0,M10.5.0/3",
+            .spring = .{ .schedule = "30 2 * * *", .expected = utcMinute(2026, .mar, 29, 1, 0) },
+            .fall = .{ .schedule = "30 2 * * *", .expected = utcMinute(2026, .oct, 25, 0, 30) },
+        },
+        .{
+            .footer = "EST5EDT,M3.2.0,M11.1.0",
+            .spring = .{ .schedule = "30 2 * * *", .expected = utcMinute(2026, .mar, 8, 7, 0) },
+            .fall = .{ .schedule = "30 1 * * *", .expected = utcMinute(2026, .nov, 1, 5, 30) },
+        },
+        .{
+            .footer = "AEST-10AEDT,M10.1.0,M4.1.0/3",
+            .spring = .{ .schedule = "30 2 * * *", .expected = utcMinute(2026, .oct, 3, 16, 0) },
+            .fall = .{ .schedule = "30 2 * * *", .expected = utcMinute(2026, .apr, 4, 15, 30) },
+        },
+        .{
+            .footer = "<+1030>-10:30<+11>-11,M10.1.0,M4.1.0",
+            .spring = .{ .schedule = "15 2 * * *", .expected = utcMinute(2026, .oct, 3, 15, 30) },
+            .fall = .{ .schedule = "45 1 * * *", .expected = utcMinute(2026, .apr, 4, 14, 45) },
+        },
+        .{
+            .footer = "IST-1GMT0,M10.5.0,M3.5.0/1",
+            .spring = .{ .schedule = "30 1 * * *", .expected = utcMinute(2026, .mar, 29, 1, 0) },
+            .fall = .{ .schedule = "30 1 * * *", .expected = utcMinute(2026, .oct, 25, 0, 30) },
+        },
+    };
+    for (cases) |case| {
+        const tz = footerTz(case.footer);
+        const zone = try TimeZone.fromTz(&tz);
+        for ([_]Transition{ case.spring, case.fall }) |transition| {
+            errdefer std.debug.print("{s} {s}\n", .{ case.footer, transition.schedule });
+            // Neighbouring days run at least 23 hours away, outside this window.
+            const first = transition.expected - 12 * 60;
+            const end = transition.expected + 12 * 60;
+
+            var daily = try TestClock.init(transition.schedule, zone);
+            defer daily.deinit();
+            try daily.dispatchRange(first, end);
+            try std.testing.expectEqual(1, daily.fired());
+            try std.testing.expectEqual(transition.expected, daily.outcomes.last_success_minute.load(.monotonic));
+
+            var quarter_hourly = try TestClock.init("*/15 * * * *", zone);
+            defer quarter_hourly.deinit();
+            try quarter_hourly.dispatchRange(first, end);
+            try std.testing.expectEqual(24 * 4, quarter_hourly.fired());
+        }
+    }
+}
+
+test "late wakes catch up fixed-time jobs skipped by less than three hours" {
+    var fixed = try TestClock.init("0,10 4 * * *", .utc);
+    defer fixed.deinit();
+    try fixed.dispatch(utcMinute(2026, .jan, 1, 3, 59));
+    try fixed.dispatch(utcMinute(2026, .jan, 1, 4, 30));
+    try std.testing.expectEqual(1, fixed.fired());
+    try fixed.dispatch(utcMinute(2026, .jan, 1, 4, 31));
+    try fixed.dispatch(utcMinute(2026, .jan, 2, 8, 0));
+    try std.testing.expectEqual(1, fixed.fired());
+
+    var wildcard = try TestClock.init("*/20 4 * * *", .utc);
+    defer wildcard.deinit();
+    try wildcard.dispatch(utcMinute(2026, .jan, 1, 4, 0));
+    try wildcard.dispatch(utcMinute(2026, .jan, 1, 4, 30));
+    try std.testing.expectEqual(1, wildcard.fired());
 }
 
 test "scheduler lifecycle and single-minute callback dispatch" {

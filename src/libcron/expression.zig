@@ -21,6 +21,10 @@ pub const Expression = struct {
     days_of_month: u32,
     months: u16,
     days_of_week: u8,
+    /// Whether each field was written starting with `*`, as in `*` or `*/n`.
+    /// The minute and hour flags decide how jobs behave across DST changes.
+    minute_star: bool,
+    hour_star: bool,
     day_of_month_star: bool,
     day_of_week_star: bool,
 
@@ -43,6 +47,8 @@ pub const Expression = struct {
             .days_of_month = @intCast(days_of_month.mask),
             .months = @intCast(months.mask),
             .days_of_week = @intCast(days_of_week.mask),
+            .minute_star = minutes.star,
+            .hour_star = hours.star,
             .day_of_month_star = days_of_month.star,
             .day_of_week_star = days_of_week.star,
         };
@@ -256,4 +262,54 @@ test "invalid dates and impossible schedules are reported" {
     const impossible = try Expression.parse("0 0 31 2 *");
     try std.testing.expectEqual(null, try impossible.next(try DateTime.init(2026, .jan, 1, 0, 0)));
     try std.testing.expectEqual(null, try daily.next(try DateTime.init(std.math.maxInt(u16), .dec, 31, 23, 59)));
+}
+
+fn scanNext(expression: Expression, after: DateTime) ?DateTime {
+    var candidate = after;
+    // Nine years covers the longest gap of every expression tested below.
+    for (0..9 * 366 * 1_440) |_| {
+        candidate = calendar.nextMinute(candidate) orelse return null;
+        if (expression.matchesUnchecked(candidate)) return candidate;
+    }
+    return null;
+}
+
+test "next agrees with a minute-by-minute scan" {
+    const sources = [_][]const u8{
+        "59 23 31 12 *",
+        "0 0 29 2 *",
+        "0 0 31 * *",
+        "*/7 */5 */3 */2 */2",
+        "30 4 1,15 * 5",
+        "0 0 1 * 1",
+        "0 0 */2 * 1",
+        "*/59 */23 */30 */11 */6",
+        "0 12 29 2 1",
+        "* * * * *",
+        "0 0 30 1-12/2 *",
+        "15 3 28-31 2 *",
+        "0 0 * 2 0-6/6",
+        "0 0 1 1 *",
+        "59 23 * * 6",
+    };
+    const starts = [_]DateTime{
+        try DateTime.init(2023, .dec, 31, 23, 59),
+        try DateTime.init(2024, .feb, 28, 23, 59),
+        try DateTime.init(2024, .feb, 29, 0, 0),
+        try DateTime.init(2024, .dec, 31, 23, 59),
+        try DateTime.init(2025, .jun, 15, 12, 34),
+        try DateTime.init(2099, .dec, 31, 23, 59),
+        try DateTime.init(2100, .feb, 28, 23, 59),
+        try DateTime.init(2399, .dec, 31, 23, 59),
+    };
+    for (sources) |source| {
+        const expression = try Expression.parse(source);
+        for (starts) |start| {
+            const expected = scanNext(expression, start) orelse return error.TestScanTooShort;
+            std.testing.expectEqual(expected, (try expression.next(start)).?) catch |err| {
+                std.debug.print("{s} after {any}\n", .{ source, start });
+                return err;
+            };
+        }
+    }
 }
