@@ -140,6 +140,8 @@ test "cancellation stops a command that ignores SIGTERM, with its process group"
     for (0..500) |_| {
         posix.kill(-pid, @fromBackingInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => return,
+            // macOS answers EPERM while the group holds only a zombie.
+            error.PermissionDenied => {},
             else => return err,
         };
         try io.sleep(.fromMilliseconds(10), .awake);

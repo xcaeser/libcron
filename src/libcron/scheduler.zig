@@ -559,7 +559,7 @@ test "scheduler applies overlap policies and cancellation cleanup" {
     defer skipped.deinit();
     _ = try skipped.add(
         every_minute,
-        .{ .callback = .{ .run = successfulTestCallback } },
+        .{ .callback = .{ .run = blockingTestCallback } },
         .{ .overlap = .skip },
     );
     var skipped_outcomes: TestOutcomes = .{};
@@ -567,8 +567,6 @@ test "scheduler applies overlap policies and cancellation cleanup" {
     defer skipped_group.cancel(std.testing.io);
     skipped.dispatchMinute(std.testing.io, &skipped_group, 0, skipped_outcomes.observer());
     skipped.dispatchMinute(std.testing.io, &skipped_group, 1, skipped_outcomes.observer());
-    try skipped_group.await(std.testing.io);
-    try std.testing.expectEqual(1, skipped_outcomes.callback_success.load(.monotonic));
     try std.testing.expectEqual(1, skipped_outcomes.skipped_overlap.load(.monotonic));
 
     var concurrent = Scheduler.init(std.testing.allocator);
