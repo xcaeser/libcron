@@ -21,13 +21,18 @@
 
 ## Features
 
-- Numeric `minute hour day-of-month month day-of-week` expressions
-- Wildcards, lists, ranges, and steps
-- POSIX day-of-month/day-of-week behavior
-- Matching and next-occurrence calculation
-- In-memory callbacks and direct child-process scheduling through `std.Io`
-- UTC, fixed-offset, and caller-parsed TZif timezones
-- A JSON-configured background daemon
+- `minute hour day-of-month month day-of-week` expressions with month and
+  weekday names, Sunday as `0` or `7`, and `@daily`-style macros
+- Wildcards, lists, ranges, and steps, with POSIX day-of-month/day-of-week
+  behavior
+- Compile-time checked expressions and field-level parse diagnostics
+- Matching, next-occurrence, and DST-aware next-instant calculation
+- In-memory callbacks and direct child-process scheduling through `std.Io`,
+  with jobs added, removed, paused, and unpaused while running
+- UTC, fixed-offset, and TZif timezones loaded from the system database,
+  following cronie across DST changes
+- A JSON-configured background daemon with per-job time zones that can run
+  at login
 - No runtime dependencies for `libcron`
 
 ## Library usage
@@ -54,54 +59,103 @@ only compiles `libcron`; Zig does not download individual files from a package.
 const std = @import("std");
 const libcron = @import("libcron");
 
-fn runBackup(_: ?*anyopaque, io: std.Io, invocation: libcron.Invocation) !void {
-    _ = io;
-    _ = invocation;
-    // Perform one scheduled invocation.
-}
+const Backup = struct {
+    target: []const u8,
+
+    fn run(self: *Backup, io: std.Io, invocation: libcron.Invocation) !void {
+        _ = io;
+        std.log.info("backing up {s} for {f}", .{ self.target, invocation.local_time });
+    }
+};
+
+const Log = struct {
+    fn record(_: *Log, invocation: libcron.Invocation, outcome: libcron.Outcome) void {
+        std.log.info("job {d}: {f}", .{ @backingInt(invocation.job_id), outcome });
+    }
+};
 
 pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var paris = try libcron.TimeZone.load(io, init.gpa, init.environ_map, "Europe/Paris");
+    defer paris.deinit();
+
     var scheduler = libcron.Scheduler.init(init.gpa);
     defer scheduler.deinit();
 
-    _ = try scheduler.add(
-        try libcron.Expression.parse("0 2 * * *"),
-        .{ .callback = .{ .run = runBackup } },
-        .{ .time_zone = try libcron.TimeZone.fixedOffset(2 * 60 * 60) },
-    );
-    _ = try scheduler.add(
-        try libcron.Expression.parse("30 3 * * 1"),
-        .{ .command = .{ .argv = &.{ "/usr/bin/env", "backup" } } },
-        .{},
-    );
+    var backup: Backup = .{ .target = "/srv/data" };
+    _ = try scheduler.add(io, .comptimeParse("30 2 * * *"), .{
+        .callback = .init(&backup, Backup.run),
+    }, .{ .time_zone = paris });
+    _ = try scheduler.add(io, try .parse("@weekly"), .{
+        .command = .{ .argv = &.{ "/usr/bin/env", "rotate-logs" } },
+    }, .{});
 
-    try scheduler.run(init.io, null);
+    var log: Log = .{};
+    try scheduler.run(io, .init(&log, Log.record));
 }
 ```
 
-`DateTime` is a Gregorian calendar minute without an attached timezone.
-`Expression.next` is exclusive and returns `null` when no later representable
-match exists. The CLI reads each job's schedule in its `time_zone`, UTC by
-default.
+`Expression.comptimeParse` checks a literal at compile time; a typo fails the
+build with the reason, such as `hour values must be within 0-23`. For text
+from users, `Expression.parseWithDiagnostics` reports the failing field and a
+short message. `Callback.init` and `Observer.init` take a typed context
+pointer, so callbacks need no casts.
 
-Configure jobs before calling `Scheduler.run`; `add` and `remove` reject
-changes while it is active. Jobs default to `.skip` overlap behavior; use
-`.concurrent` to launch every due occurrence. Commands execute the supplied
-argv directly, without a shell, inherit stdout/stderr, ignore stdin, and are
-killed when the scheduler is canceled.
+`Scheduler.run` blocks until canceled. Run it in its own task (for example
+with `io.concurrent`) to keep changing jobs: `add`, `remove`, `pause`, and
+`unpause` work at any time, also while `run` is active. A job added while
+running first fires at its next matching minute; a removed job's running
+invocation finishes and reports its outcome; an unpaused job does not catch up
+minutes it missed. `add` copies a command's argv, working directory, and
+environment, so they can be freed once it returns; a callback's context must
+stay valid until the job is removed or the scheduler is deinitialized. The
+observer is called from the scheduler's and the jobs' tasks, so it must be
+thread-safe, but never with the scheduler locked, so it may add, remove,
+pause, or unpause jobs.
+
+Jobs follow the local time of their `TimeZone` the way cronie does. When the
+clock springs forward, a fixed-time job whose time was skipped runs once at
+the first minute after the gap. When the clock falls back, a fixed-time job
+runs only in the first pass of the repeated hour, while jobs whose minute or
+hour field starts with `*` run on every real matching minute. A late wake
+after a suspend runs fixed-time jobs skipped by less than three hours once;
+longer gaps are not caught up. A system clock stepped back by less than three
+hours never reruns a minute; a larger step is taken as the new time.
+`Expression.nextInstant` answers when a job will next fire under these rules.
+
+Jobs default to `.skip` overlap behavior; use `.concurrent` to launch every
+due occurrence. Commands execute the supplied argv directly, without a shell,
+inherit stdout and stderr, ignore stdin, and run in their own process group.
+Canceling the scheduler sends SIGTERM to that group, then SIGKILL after
+`JobOptions.termination_grace` (10 seconds by default), so commands that trap
+SIGTERM and their background children do not outlive it.
+
+`DateTime` is a Gregorian calendar minute without an attached timezone and
+formats as `2026-10-25 02:30`. `Expression.next` is exclusive and returns
+`null` when no later representable match exists.
 
 ### API
 
-- `Expression.parse(source) !Expression`
+- `Expression.parse(source) ParseError!Expression`
+- `Expression.parseWithDiagnostics(source, *Diagnostics) ParseError!Expression`
+- `Expression.comptimeParse(comptime source) Expression`
 - `expression.matches(date_time) !bool`
 - `expression.next(after) !?DateTime`
+- `expression.nextInstant(after_unix_seconds, time_zone) ?i64`
 - `DateTime.init(year, month, day, hour, minute) !DateTime`
-- `TimeZone.fixedOffset(seconds) !TimeZone`
+- `TimeZone.utc`, `TimeZone.fixedOffset(seconds) !TimeZone`
+- `TimeZone.load(io, allocator, environ_map, name) !TimeZone` / `time_zone.deinit()`
 - `TimeZone.fromTz(tz) !TimeZone`
+- `time_zone.toLocal(unix_seconds) !DateTime`
+- `time_zone.nextTransition(unix_seconds) !?i64`
 - `Scheduler.init(allocator)` / `scheduler.deinit()`
-- `scheduler.add(expression, task, options) !JobId`
-- `scheduler.remove(id) !bool`
-- `scheduler.run(io, observer) !void`
+- `scheduler.add(io, expression, task, options) !JobId`
+- `scheduler.remove(io, id) bool`
+- `scheduler.pause(io, id) bool` / `scheduler.unpause(io, id) bool`
+- `scheduler.run(io, observer) RunError!void`
+- `Callback.init(context, run)`, `Observer.init(context, notify)`
+- `command.validate() !void` — the checks `scheduler.add` runs on a command
+- `outcome.format`, `date_time.format` (use `{f}`)
 
 ## CLI usage
 
@@ -155,9 +209,9 @@ starts at login and is restarted after a crash, while `croner stop` still keeps
 it down until `croner start` or the next login; `croner start` goes through the
 service manager once a config is enabled. The unit records the config path,
 `CRONER_HOME`, and the current `PATH` and `TZDIR`, so jobs find the same
-programs and time zones; run `croner enable` again after changing them. On Linux, jobs stop when you log out
-unless you run `loginctl enable-linger`. Runs missed while the machine was off
-are not caught up.
+programs and time zones; run `croner enable` again after changing them. On
+Linux, jobs stop when you log out unless you run `loginctl enable-linger`.
+Runs missed while the machine was off are not caught up.
 
 ### Configuration
 
@@ -187,35 +241,51 @@ The editor schema is published at
 }
 ```
 
-Each job requires a nonempty unique `id`, a five-field `schedule`, and an
-`action`. `action.command.argv` is a nonempty direct argv array; it never gets
-an implicit shell. Use an executable shebang or an explicit argv such as
-`["bash", "script.sh"]` for shell scripts. `cwd` defaults to the config
-directory, and relative paths resolve from there. `env` overlays the daemon's
-inherited environment. `overlap` is `skip` or `concurrent` and defaults to
-`skip`. `time_zone` is the IANA zone, such as `Europe/Paris`, the schedule is
-read in; it defaults to UTC. Unknown fields, malformed environment names,
-invalid schedules, unknown time zones, and invalid commands are rejected
-before startup or reload, with a message that names the job and the field.
-`$schema` is editor metadata and may point anywhere.
+Each job requires a nonempty unique `id`, a `schedule` (see
+[Syntax](#syntax)), and an `action`. `action.command.argv` is a nonempty
+direct argv array; it never gets an implicit shell. Use an executable shebang
+or an explicit argv such as `["bash", "script.sh"]` for shell scripts. `cwd`
+defaults to the config directory, and relative paths resolve from there. `env`
+overlays the daemon's inherited environment. `overlap` is `skip` or
+`concurrent` and defaults to `skip`. `time_zone` is the IANA zone, such as
+`Europe/Paris`, the schedule is read in, with the DST rules described under
+[Library usage](#library-usage); it defaults to UTC. Unknown fields, malformed
+environment names, invalid schedules, unknown time zones, and invalid commands
+are rejected before startup or reload, with a message that names the job and
+the field. `$schema` is editor metadata and may point anywhere.
 
 ## Syntax
 
-| Field        | Values                |
-| ------------ | --------------------- |
-| Minute       | `0-59`                |
-| Hour         | `0-23`                |
-| Day of month | `1-31`                |
-| Month        | `1-12`                |
-| Day of week  | `0-6` (`0` is Sunday) |
+| Field        | Values                                        |
+| ------------ | --------------------------------------------- |
+| Minute       | `0-59`                                        |
+| Hour         | `0-23`                                        |
+| Day of month | `1-31`                                        |
+| Month        | `1-12` or `JAN`-`DEC`                         |
+| Day of week  | `0-7` or `SUN`-`SAT` (`0` and `7` are Sunday) |
 
-Each field accepts `*`, a number, comma-separated numbers or ranges, `*/step`,
-and `range/step`. Ranges are inclusive and cannot wrap. Month and weekday
-names, Sunday `7`, macros, and special operators are unsupported.
+Each field accepts `*`, a value, an inclusive range `a-b`, a step `*/n` or
+`a-b/n`, and `a/n`, which steps from `a` to the field's maximum (`5/15` in the
+minute field is `5,20,35,50`). Combine them with commas, as in `0,30` or
+`MON-FRI,SUN`. Names are three letters in any case and work in ranges. A
+weekday range may end on Sunday, as in `FRI-SUN`. Ranges cannot otherwise
+wrap. Fields are separated by spaces, tabs, or line breaks.
 
-When both day fields are restricted, either may match. When either uses `*`
-(including `*/step`), both day fields must match, following traditional cron
-wildcard behavior.
+| Macro                   | Same as     |
+| ----------------------- | ----------- |
+| `@yearly`, `@annually`  | `0 0 1 1 *` |
+| `@monthly`              | `0 0 1 * *` |
+| `@weekly`               | `0 0 * * 0` |
+| `@daily`, `@midnight`   | `0 0 * * *` |
+| `@hourly`               | `0 * * * *` |
+
+Macros are lowercase. `@reboot`, `L`, `W`, `#`, seconds, and years are not
+supported.
+
+When both day fields are restricted, either may match. When either starts
+with `*` (including `*/step`), both day fields must match, following
+traditional cron wildcard behavior. A schedule whose day of week is `*` and
+whose months never have its days, such as `0 0 31 2 *`, is rejected.
 
 ## Development
 
