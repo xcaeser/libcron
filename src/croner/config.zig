@@ -11,10 +11,12 @@ const max_config_bytes = 1024 * 1024;
 
 const EnvJson = std.json.ArrayHashMap([]const u8);
 
+// Optional fields have concrete defaults rather than `?T`: std.json reads
+// `null` into an optional as if it were absent, and the schema forbids null.
 pub const CommandJson = struct {
     argv: []const []const u8,
-    cwd: ?[]const u8 = null,
-    env: ?EnvJson = null,
+    cwd: []const u8 = ".",
+    env: EnvJson = .{},
 };
 
 const ActionJson = struct {
@@ -26,11 +28,11 @@ pub const JobJson = struct {
     schedule: []const u8,
     action: ActionJson,
     overlap: libcron.OverlapPolicy = .skip,
-    time_zone: ?[]const u8 = null,
+    time_zone: []const u8 = "UTC",
 };
 
 pub const ConfigJson = struct {
-    @"$schema": ?[]const u8 = null,
+    @"$schema": []const u8 = "",
     jobs: []const JobJson,
 };
 
@@ -45,8 +47,8 @@ pub const JobSpec = struct {
     cwd: []const u8,
     env: []const EnvPair,
     overlap: libcron.OverlapPolicy,
-    /// The IANA name as written; `null` means UTC.
-    time_zone_name: ?[]const u8,
+    /// The IANA name as written, `UTC` when absent.
+    time_zone_name: []const u8,
     /// Loaded into the spec's arena, so it lives exactly as long as the spec.
     time_zone: libcron.TimeZone,
 
@@ -73,7 +75,8 @@ pub const JobSpec = struct {
         const command = job.action.command;
         const argv = try a.alloc([]const u8, command.argv.len);
         for (command.argv, argv) |arg, *copy| copy.* = try a.dupe(u8, arg);
-        const cwd = try std.fs.path.resolve(a, &.{ config_dir, command.cwd orelse "." });
+        if (command.cwd.len == 0) return reject(problem, "job \"{s}\": action.command.cwd must not be empty", .{job.id});
+        const cwd = try std.fs.path.resolve(a, &.{ config_dir, command.cwd });
 
         const runnable: libcron.Command = .{ .argv = argv, .cwd = .{ .path = cwd } };
         runnable.validate() catch return reject(
@@ -82,10 +85,9 @@ pub const JobSpec = struct {
             .{job.id},
         );
 
-        const env_len = if (command.env) |env| env.map.count() else 0;
-        const env = try a.alloc(EnvPair, env_len);
-        if (command.env) |json_env| {
-            var it = json_env.map.iterator();
+        const env = try a.alloc(EnvPair, command.env.map.count());
+        {
+            var it = command.env.map.iterator();
             var i: usize = 0;
             while (it.next()) |entry| : (i += 1) {
                 const key = entry.key_ptr.*;
@@ -104,8 +106,10 @@ pub const JobSpec = struct {
                 return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             }
         }.lessThan);
-        const time_zone_name = if (job.time_zone) |name| try a.dupe(u8, name) else null;
-        const time_zone: libcron.TimeZone = if (time_zone_name) |name|
+        const name = try a.dupe(u8, job.time_zone);
+        const time_zone: libcron.TimeZone = if (std.mem.eql(u8, name, "UTC"))
+            .utc
+        else
             libcron.TimeZone.load(io, a, environ, name) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.FileNotFound, error.InvalidTimeZoneName, error.IsDir, error.NotDir => {
@@ -121,9 +125,7 @@ pub const JobSpec = struct {
                     );
                 },
                 else => return reject(problem, "job \"{s}\": time_zone \"{s}\" could not be loaded: {t}", .{ job.id, name, err }),
-            }
-        else
-            .utc;
+            };
         const id = try a.dupe(u8, job.id);
 
         return .{
@@ -135,7 +137,7 @@ pub const JobSpec = struct {
             .cwd = cwd,
             .env = env,
             .overlap = job.overlap,
-            .time_zone_name = time_zone_name,
+            .time_zone_name = name,
             .time_zone = time_zone,
         };
     }
@@ -149,7 +151,7 @@ pub const JobSpec = struct {
         if (!std.mem.eql(u8, lhs.schedule, rhs.schedule) or
             !std.mem.eql(u8, lhs.cwd, rhs.cwd) or lhs.overlap != rhs.overlap or
             lhs.argv.len != rhs.argv.len or lhs.env.len != rhs.env.len) return false;
-        if (!std.mem.eql(u8, lhs.time_zone_name orelse "", rhs.time_zone_name orelse "")) return false;
+        if (!std.mem.eql(u8, lhs.time_zone_name, rhs.time_zone_name)) return false;
         for (lhs.argv, rhs.argv) |a, b| if (!std.mem.eql(u8, a, b)) return false;
         for (lhs.env, rhs.env) |a, b| {
             if (!std.mem.eql(u8, a.key, b.key) or !std.mem.eql(u8, a.value, b.value)) return false;
@@ -300,6 +302,12 @@ test "config parser rejects unknown fields and invalid schedules" {
     try expectProblem("job \"x\": schedule \"not cron\": expected five fields: minute hour day-of-month month day-of-week", invalid_schedule);
     const out_of_range = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"0 25 * * *\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
     try expectProblem("job \"x\": schedule \"0 25 * * *\": hour values must be within 0-23", out_of_range);
+    try expectProblem(
+        "job \"x\": action.command.cwd must not be empty",
+        "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"],\"cwd\":\"\"}}}]}",
+    );
+    // The schema forbids null, so the parser does too.
+    try expectProblem("line 1, column 55: value has the wrong type", "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"time_zone\":null,\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}");
     const empty_argv = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[]}}}]}";
     try expectProblem("job \"x\": action.command.argv needs a nonempty first element, and argv and cwd may not contain NUL bytes", empty_argv);
 

@@ -37,7 +37,8 @@
         "time_zone": {
           "type": "string",
           "minLength": 1,
-          "description": "An IANA time zone name such as Europe/Paris. Defaults to UTC."
+          "default": "UTC",
+          "description": "An IANA time zone name such as Europe/Paris."
         },
         "action": {
           "$ref": "#/$defs/action"
@@ -67,9 +68,15 @@
         "argv": {
           "type": "array",
           "minItems": 1,
+          "prefixItems": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "description": "The program to run, without a shell."
+            }
+          ],
           "items": {
-            "type": "string",
-            "minLength": 1
+            "type": "string"
           }
         },
         "cwd": {
