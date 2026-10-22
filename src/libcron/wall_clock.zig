@@ -9,34 +9,61 @@ const time_zone = @import("time_zone.zig");
 const DateTime = calendar.DateTime;
 const TimeZone = time_zone.TimeZone;
 
-/// Wall-clock steps of this many minutes or more, either way, are taken as
+/// Wall-clock steps of more than this many minutes, either way, are taken as
 /// the new time without catching up or holding back.
 pub const max_catch_up_minutes = 3 * 60;
 
-/// One job's view of its wall clock between dispatched minutes.
+/// One job's view of its wall clock between dispatched minutes. The rules
+/// are spelled out on `Scheduler`.
 pub const WallClock = struct {
-    /// The latest wall-clock minute dispatched. It does not move back while
-    /// the wall clock repeats after a DST change.
+    /// The latest wall-clock minute seen. It does not move back while the
+    /// wall clock repeats.
     high: ?DateTime = null,
 
-    /// Decides whether `expression` fires at wall-clock minute `local`. When
-    /// the wall clock repeats, only jobs with a `*` minute or hour run again.
-    /// When it jumps ahead by less than three hours (spring-forward, late
-    /// wake), a fixed-time job that matched any skipped minute runs once.
-    pub fn due(self: *WallClock, expression: Expression, local: DateTime) bool {
-        const matches = expression.matches(local) catch unreachable;
+    /// Records that the wall clock reads `local` and returns the wall-clock
+    /// minutes `expression` fires for now.
+    pub fn advance(self: *WallClock, expression: Expression, local: DateTime) Fires {
+        const only_local: Fires = .{ .expression = expression, .after = null, .until = local };
         const previous = self.high orelse {
             self.high = local;
-            return matches;
+            return only_local;
         };
         const step = calendar.epochMinute(local) - calendar.epochMinute(previous);
         const wildcard = expression.minute_star or expression.hour_star;
-        if (step <= 0 and step > -max_catch_up_minutes) return wildcard and matches;
+        if (step <= 0 and step >= -max_catch_up_minutes) return if (wildcard) only_local else .none;
 
         self.high = local;
-        if (step == 1 or wildcard or @abs(step) >= max_catch_up_minutes) return matches;
-        const skipped = (expression.next(previous) catch unreachable) orelse return false;
-        return calendar.epochMinute(skipped) <= calendar.epochMinute(local);
+        if (step == 1 or wildcard or step > max_catch_up_minutes or step < -max_catch_up_minutes) return only_local;
+        return .{ .expression = expression, .after = previous, .until = local };
+    }
+};
+
+/// Matching wall-clock minutes up to `until`, oldest first.
+pub const Fires = struct {
+    expression: Expression,
+    /// Matches after this minute are left; `null` when only `until` is.
+    after: ?DateTime,
+    until: DateTime,
+    done: bool = false,
+
+    pub const none: Fires = .{ .expression = undefined, .after = null, .until = undefined, .done = true };
+
+    pub fn next(self: *Fires) ?DateTime {
+        if (self.done) return null;
+        const after = self.after orelse {
+            self.done = true;
+            return if (self.expression.matches(self.until) catch unreachable) self.until else null;
+        };
+        const found = (self.expression.next(after) catch unreachable) orelse {
+            self.done = true;
+            return null;
+        };
+        if (calendar.epochMinute(found) > calendar.epochMinute(self.until)) {
+            self.done = true;
+            return null;
+        }
+        self.after = found;
+        return found;
     }
 };
 
@@ -52,7 +79,8 @@ pub fn nextInstant(expression: Expression, after_unix_seconds: i64, zone: TimeZo
         const first = minute + 1;
         const local = try zone.toLocal(first * 60);
         // The wall clock may have jumped since `minute`.
-        if (clock.due(expression, local) and first > after_minute) return first * 60;
+        var fires = clock.advance(expression, local);
+        if (fires.next() != null and first > after_minute) return first * 60;
         const high = clock.high.?;
 
         // Until the next transition, the wall clock advances a minute a minute.
@@ -116,8 +144,8 @@ test "nextInstant agrees with a minute-by-minute replay of the wall-clock rules"
                 var clock: WallClock = .{};
                 var minute = replay_first;
                 while (minute < transition + 9 * 1_440) : (minute += 1) {
-                    if (clock.due(expression, try zone.toLocal(minute * 60)))
-                        try fires.append(std.testing.allocator, minute);
+                    var due = clock.advance(expression, try zone.toLocal(minute * 60));
+                    if (due.next() != null) try fires.append(std.testing.allocator, minute);
                 }
 
                 var start = (transition - 1_440) * 60 + 17;

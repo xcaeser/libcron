@@ -18,9 +18,11 @@ pub const OverlapPolicy = enum {
 
 pub const Invocation = struct {
     job_id: JobId,
-    /// The start of the minute the job was dispatched for, in seconds since
+    /// The start of the minute the job was dispatched at, in seconds since
     /// the Unix epoch.
     scheduled_unix_seconds: i64,
+    /// The wall-clock minute the run is for. After the clock jumps ahead it
+    /// can be a skipped minute before `scheduled_unix_seconds`.
     local_time: DateTime,
 };
 

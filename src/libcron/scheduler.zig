@@ -5,6 +5,7 @@ const calendar = @import("calendar.zig");
 const command = @import("command.zig");
 const Expression = @import("expression.zig").Expression;
 const TimeZone = @import("time_zone.zig").TimeZone;
+const DateTime = calendar.DateTime;
 const job_module = @import("job.zig");
 
 const Invocation = job_module.Invocation;
@@ -14,7 +15,7 @@ const JobOptions = job_module.JobOptions;
 const Observer = job_module.Observer;
 const Outcome = job_module.Outcome;
 const Task = job_module.Task;
-const max_catch_up_minutes = @import("wall_clock.zig").max_catch_up_minutes;
+const Fires = @import("wall_clock.zig").Fires;
 const report = job_module.report;
 
 pub const AddError = std.mem.Allocator.Error || error{
@@ -27,9 +28,30 @@ pub const RunError = std.Io.Cancelable || error{
     AlreadyRunning,
 };
 
-/// An in-memory scheduler. Jobs can be added, removed, paused, and unpaused
-/// from any task at any time, also while `run` is active. Call `deinit` only
-/// after `run` has returned.
+/// An in-memory scheduler. Jobs can be added, replaced, removed, paused, and
+/// unpaused from any task at any time, also while `run` is active. Call
+/// `deinit` only after `run` has returned.
+///
+/// `run` dispatches every minute that starts on the real clock, including
+/// minutes repeated after the clock is set back. A job reads each dispatched
+/// minute on its time zone's wall clock and compares it with its mark, the
+/// latest wall-clock minute it has seen, which never moves back:
+///
+/// - No mark yet, one minute after the mark, or more than three hours before
+///   or after it: the job runs if the minute matches, and the minute becomes
+///   the mark. Nothing is caught up or held back.
+/// - The mark itself or up to three hours before it, as in a repeated
+///   fall-back hour or after the clock is set back: a job whose minute or
+///   hour field starts with `*` runs if the minute matches; other jobs do
+///   not run. The mark stays until the wall clock passes it.
+/// - Two minutes to three hours after the mark, as after spring-forward, a
+///   late wake, or the clock set ahead: a job whose minute or hour field
+///   starts with `*` runs if the minute matches; another job runs once for
+///   each matching wall-clock minute after the mark up to this one, with that
+///   minute as `Invocation.local_time`, so its overlap policy decides whether
+///   the runs pile up. The minute becomes the mark.
+///
+/// A paused job keeps its mark current. `run` starts every job without one.
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
     /// Guards every field below, and every field of their jobs except
@@ -209,11 +231,9 @@ pub const Scheduler = struct {
                 self.dispatchMinute(io, &jobs, minute, observer);
                 last_minute = minute;
             }
-            const deadline: std.Io.Clock.Timestamp = .{
-                .raw = .{ .nanoseconds = step.deadline_ns },
-                .clock = .real,
-            };
-            try deadline.wait(io);
+            // A relative sleep that counts suspended time wakes on time even
+            // if the real clock is set back or the machine sleeps meanwhile.
+            try io.sleep(step.sleep, .boot);
         }
     }
 
@@ -227,7 +247,7 @@ pub const Scheduler = struct {
         self.sweep(io);
         // Only instants outside the years 1 through 65535 fail to convert.
         const unix_seconds = std.math.mul(i64, unix_minute, 60) catch return;
-        var cursor: u64 = 0;
+        var cursor: Cursor = .{};
         while (self.nextDue(io, &cursor, unix_seconds)) |due| switch (due) {
             .skipped => |invocation| report(observer, invocation, .skipped_overlap),
             .claimed => |claimed| group.concurrent(
@@ -251,40 +271,61 @@ pub const Scheduler = struct {
         },
     };
 
+    const Cursor = struct {
+        /// The first job id not looked at yet.
+        next_id: u64 = 0,
+        /// More wall-clock minutes owed to the job before `next_id`.
+        pending: ?Fires = null,
+    };
+
     const Stale = struct {
         job: *Job,
         arena: std.heap.ArenaAllocator,
     };
 
-    /// Finds the first job with an id at or after `cursor` that is due, and
-    /// moves `cursor` past it. The lock is held only during the search, so
-    /// the caller can start the job and notify the observer unlocked.
-    fn nextDue(self: *Scheduler, io: std.Io, cursor: *u64, unix_seconds: i64) ?Due {
+    /// Finds the next run due at `unix_seconds`, the remaining wall-clock
+    /// minutes owed to the last job first, and moves `cursor` past it. The
+    /// lock is held only during the search, so the caller can start the job
+    /// and notify the observer unlocked.
+    fn nextDue(self: *Scheduler, io: std.Io, cursor: *Cursor, unix_seconds: i64) ?Due {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        const start = std.sort.partitionPoint(*Job, self.jobs.items, cursor.*, idBefore);
+        if (cursor.pending) |*fires| {
+            if (self.indexOf(@fromBackingInt(cursor.next_id - 1))) |index| {
+                const job = self.jobs.items[index];
+                if (!job.paused) if (fires.next()) |wall_minute| return dueAt(job, wall_minute, unix_seconds);
+            }
+            cursor.pending = null;
+        }
+        const start = std.sort.partitionPoint(*Job, self.jobs.items, cursor.next_id, idBefore);
         for (self.jobs.items[start..]) |job| {
-            cursor.* = @backingInt(job.id) + 1;
+            cursor.next_id = @backingInt(job.id) + 1;
             const local_time = job.options.time_zone.toLocal(unix_seconds) catch continue;
             job.seen = .{ .unix_seconds = unix_seconds, .local = local_time };
             // A paused job's wall clock keeps running, so unpausing it inside
             // a repeated hour does not rerun it and nothing is caught up.
-            const due = job.wall.due(job.expression, local_time);
-            if (job.paused or !due) continue;
-            const invocation: Invocation = .{
-                .job_id = job.id,
-                .scheduled_unix_seconds = unix_seconds,
-                .local_time = local_time,
-            };
-            if (!job.claim()) return .{ .skipped = invocation };
-            return .{ .claimed = .{
-                .job = job,
-                .task = job.task,
-                .termination_grace = job.options.termination_grace,
-                .invocation = invocation,
-            } };
+            var fires = job.wall.advance(job.expression, local_time);
+            if (job.paused) continue;
+            const wall_minute = fires.next() orelse continue;
+            cursor.pending = fires;
+            return dueAt(job, wall_minute, unix_seconds);
         }
         return null;
+    }
+
+    fn dueAt(job: *Job, wall_minute: DateTime, unix_seconds: i64) Due {
+        const invocation: Invocation = .{
+            .job_id = job.id,
+            .scheduled_unix_seconds = unix_seconds,
+            .local_time = wall_minute,
+        };
+        if (!job.claim()) return .{ .skipped = invocation };
+        return .{ .claimed = .{
+            .job = job,
+            .task = job.task,
+            .termination_grace = job.options.termination_grace,
+            .invocation = invocation,
+        } };
     }
 
     fn idBefore(cursor: u64, job: *Job) bool {
@@ -336,22 +377,18 @@ fn unixMinute(unix_nanoseconds: i96) i64 {
 
 const Tick = struct {
     due_minute: ?i64,
-    deadline_ns: i96,
+    /// Until the next minute starts on the real clock.
+    sleep: std.Io.Duration,
 };
 
-/// Decides what the run loop does after reading the real clock: which unix
-/// minute to dispatch, if any, and when to read the clock again. A minute at
-/// or before `last_minute` is never dispatched again, so a wall clock stepped
-/// back, or a relative sleep that outlasts such a step, cannot rerun jobs. A
-/// step back of three hours or more is taken as the new time instead of
-/// leaving the scheduler idle until the clock catches up.
+/// Decides what the run loop does after reading the real clock: the unix
+/// minute to dispatch, whenever it differs from the last one dispatched in
+/// either direction, and how long to sleep until the next minute starts.
 fn tick(now_ns: i96, last_minute: i64) Tick {
     const minute = unixMinute(now_ns);
-    const due = minute > last_minute or last_minute - minute >= max_catch_up_minutes;
-    const wake_minute = if (due) minute + 1 else last_minute + 1;
     return .{
-        .due_minute = if (due) minute else null,
-        .deadline_ns = @as(i96, wake_minute) * std.time.ns_per_min,
+        .due_minute = if (minute != last_minute) minute else null,
+        .sleep = .fromNanoseconds((@as(i96, minute) + 1) * std.time.ns_per_min - now_ns),
     };
 }
 
@@ -448,30 +485,36 @@ fn footerTz(footer: []const u8) std.Tz {
     };
 }
 
-test "run loop never dispatches a minute twice when the wall clock steps back" {
+test "the run loop dispatches every minute the real clock starts, also after it is set back" {
     const minute_ns: i96 = std.time.ns_per_min;
     const last: i64 = 29_000_000;
+    try std.testing.expectEqual(last + 1, tick((last + 1) * minute_ns + 5, last).due_minute);
+    try std.testing.expectEqual(null, tick(last * minute_ns + 30 * std.time.ns_per_s, last).due_minute);
+    try std.testing.expectEqual(last - 10, tick((last - 10) * minute_ns, last).due_minute);
+    try std.testing.expectEqual(last + 90, tick((last + 90) * minute_ns, last).due_minute);
     try std.testing.expectEqual(
-        Tick{ .due_minute = last + 1, .deadline_ns = (last + 2) * minute_ns },
-        tick((last + 1) * minute_ns + 5, last),
+        std.Io.Duration.fromSeconds(30),
+        tick(last * minute_ns + 30 * std.time.ns_per_s, last).sleep,
     );
-    try std.testing.expectEqual(
-        Tick{ .due_minute = null, .deadline_ns = (last + 1) * minute_ns },
-        tick(last * minute_ns + 30 * std.time.ns_per_s, last),
-    );
-    try std.testing.expectEqual(
-        Tick{ .due_minute = null, .deadline_ns = (last + 1) * minute_ns },
-        tick((last - 10) * minute_ns, last),
-    );
-    try std.testing.expectEqual(
-        Tick{ .due_minute = last + 90, .deadline_ns = (last + 91) * minute_ns },
-        tick((last + 90) * minute_ns, last),
-    );
-    try std.testing.expectEqual(
-        Tick{ .due_minute = last - 180, .deadline_ns = (last - 179) * minute_ns },
-        tick((last - 180) * minute_ns, last),
-    );
+    try std.testing.expectEqual(std.Io.Duration.fromSeconds(60), tick((last - 10) * minute_ns, last).sleep);
     try std.testing.expectEqual(-1, unixMinute(-1));
+}
+
+test "a clock set back reruns wildcard jobs and holds fixed-time jobs back" {
+    // 10:00 to 10:30, then the clock is set back to 10:20 and runs to 10:40.
+    const first = utcMinute(2026, .jan, 1, 10, 0);
+    const cases = [_]struct { schedule: []const u8, fires: u32 }{
+        .{ .schedule = "*/5 * * * *", .fires = 7 + 5 },
+        .{ .schedule = "25 10 * * *", .fires = 1 },
+        .{ .schedule = "35 10 * * *", .fires = 1 },
+    };
+    for (cases) |case| {
+        var clock = try TestClock.init(case.schedule, .utc);
+        defer clock.deinit();
+        try clock.dispatchRange(first, first + 31);
+        try clock.dispatchRange(first + 20, first + 41);
+        try std.testing.expectEqual(case.fires, clock.fired());
+    }
 }
 
 test "fixed-time jobs run once and wildcard jobs every real quarter hour across DST" {
@@ -530,21 +573,54 @@ test "fixed-time jobs run once and wildcard jobs every real quarter hour across 
     }
 }
 
-test "late wakes catch up fixed-time jobs skipped by less than three hours" {
-    var fixed = try TestClock.init("0,10 4 * * *", .utc);
-    defer fixed.deinit();
-    try fixed.dispatch(utcMinute(2026, .jan, 1, 3, 59));
-    try fixed.dispatch(utcMinute(2026, .jan, 1, 4, 30));
-    try std.testing.expectEqual(1, fixed.fired());
-    try fixed.dispatch(utcMinute(2026, .jan, 1, 4, 31));
-    try fixed.dispatch(utcMinute(2026, .jan, 2, 8, 0));
-    try std.testing.expectEqual(1, fixed.fired());
+const LocalHours = struct {
+    seen: std.atomic.Value(u32) = .init(0),
+    runs: std.atomic.Value(u32) = .init(0),
+
+    fn record(self: *LocalHours, invocation: Invocation, outcome: Outcome) void {
+        if (outcome != .callback_success) return;
+        _ = self.seen.fetchOr(@as(u32, 1) << @intCast(invocation.local_time.hour), .monotonic);
+        _ = self.runs.fetchAdd(1, .monotonic);
+    }
+};
+
+test "a jump ahead of up to three hours runs each skipped fixed-time match" {
+    var at_limit = try TestClock.init("30 2 * * *", .utc);
+    defer at_limit.deinit();
+    try at_limit.dispatch(utcMinute(2026, .jan, 1, 1, 0));
+    try at_limit.dispatch(utcMinute(2026, .jan, 1, 4, 0));
+    try std.testing.expectEqual(1, at_limit.fired());
+
+    var past_limit = try TestClock.init("30 2 * * *", .utc);
+    defer past_limit.deinit();
+    try past_limit.dispatch(utcMinute(2026, .jan, 1, 1, 0));
+    try past_limit.dispatch(utcMinute(2026, .jan, 1, 4, 1));
+    try std.testing.expectEqual(0, past_limit.fired());
 
     var wildcard = try TestClock.init("*/20 4 * * *", .utc);
     defer wildcard.deinit();
     try wildcard.dispatch(utcMinute(2026, .jan, 1, 4, 0));
     try wildcard.dispatch(utcMinute(2026, .jan, 1, 4, 30));
     try std.testing.expectEqual(1, wildcard.fired());
+
+    // Both skipped matches run, each for its own wall-clock minute.
+    const io = std.testing.io;
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    _ = try scheduler.add(
+        io,
+        try Expression.parse("0 1,2 * * *"),
+        .{ .callback = .{ .run = successfulTestCallback } },
+        .{ .overlap = .concurrent },
+    );
+    var hours: LocalHours = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    scheduler.dispatchMinute(io, &group, utcMinute(2026, .jan, 1, 0, 30), .init(&hours, LocalHours.record));
+    scheduler.dispatchMinute(io, &group, utcMinute(2026, .jan, 1, 3, 0), .init(&hours, LocalHours.record));
+    try group.await(io);
+    try std.testing.expectEqual(2, hours.runs.load(.monotonic));
+    try std.testing.expectEqual((1 << 1) | (1 << 2), hours.seen.load(.monotonic));
 }
 
 test "scheduler lifecycle and single-minute callback dispatch" {
