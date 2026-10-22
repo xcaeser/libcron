@@ -111,7 +111,7 @@ fn commandSetup(ctx: zli.CommandContext) !void {
     const config_dir = std.fs.path.dirname(config_path) orelse ".";
     var problem_buffer: [1024]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    var checked = JobSpec.init(app.allocator, app.io, job, config_dir, &problem) catch |err| switch (err) {
+    var checked = JobSpec.init(app.allocator, job, config_dir, &problem) catch |err| switch (err) {
         error.InvalidConfig => return fail(ctx, "{s}", .{problem.buffered()}),
         else => return err,
     };

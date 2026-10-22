@@ -46,7 +46,7 @@ pub const JobSpec = struct {
     overlap: libcron.OverlapPolicy,
 
     /// On `error.InvalidConfig`, `problem` says which job and field are wrong.
-    pub fn init(gpa: Allocator, io: Io, job: JobJson, config_dir: []const u8, problem: *Io.Writer) !JobSpec {
+    pub fn init(gpa: Allocator, job: JobJson, config_dir: []const u8, problem: *Io.Writer) !JobSpec {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -63,17 +63,12 @@ pub const JobSpec = struct {
         for (command.argv, argv) |arg, *copy| copy.* = try a.dupe(u8, arg);
         const cwd = try std.fs.path.resolve(a, &.{ config_dir, command.cwd orelse "." });
 
-        // Scheduler.add owns the rules for a runnable command.
-        var check = libcron.Scheduler.init(a);
-        defer check.deinit();
-        _ = check.add(io, expression, .{ .command = .{ .argv = argv, .cwd = .{ .path = cwd } } }, .{}) catch |err| switch (err) {
-            error.InvalidCommand => return reject(
-                problem,
-                "job \"{s}\": action.command.argv needs a nonempty first element, and argv and cwd may not contain NUL bytes",
-                .{job.id},
-            ),
-            else => return err,
-        };
+        const runnable: libcron.Command = .{ .argv = argv, .cwd = .{ .path = cwd } };
+        runnable.validate() catch return reject(
+            problem,
+            "job \"{s}\": action.command.argv needs a nonempty first element, and argv and cwd may not contain NUL bytes",
+            .{job.id},
+        );
 
         const env_len = if (command.env) |env| env.map.count() else 0;
         const env = try a.alloc(EnvPair, env_len);
@@ -167,7 +162,7 @@ fn jsonProblem(err: anyerror) []const u8 {
     };
 }
 
-fn parseConfig(allocator: Allocator, io: Io, bytes: []const u8, config_dir: []const u8, problem: *Io.Writer) !LoadedSpecs {
+fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8, problem: *Io.Writer) !LoadedSpecs {
     var scanner = std.json.Scanner.initCompleteInput(allocator, bytes);
     defer scanner.deinit();
     var diagnostics: std.json.Diagnostics = .{};
@@ -194,7 +189,7 @@ fn parseConfig(allocator: Allocator, io: Io, bytes: []const u8, config_dir: []co
     for (parsed.value.jobs) |job| {
         if ((ids.getOrPutAssumeCapacity(job.id)).found_existing)
             return reject(problem, "job id \"{s}\" is used more than once", .{job.id});
-        var spec = try JobSpec.init(allocator, io, job, config_dir, problem);
+        var spec = try JobSpec.init(allocator, job, config_dir, problem);
         errdefer spec.deinit();
         result.items.appendAssumeCapacity(spec.move());
     }
@@ -210,7 +205,7 @@ pub fn loadConfig(allocator: Allocator, io: Io, path: []const u8, problem: *Io.W
     };
     defer allocator.free(bytes);
     problem.print("{s}: ", .{path}) catch {};
-    return parseConfig(allocator, io, bytes, std.fs.path.dirname(path) orelse ".", problem);
+    return parseConfig(allocator, bytes, std.fs.path.dirname(path) orelse ".", problem);
 }
 
 pub fn resolveFromCwd(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
@@ -223,7 +218,7 @@ pub fn resolveFromCwd(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
 fn expectProblem(expected: []const u8, config: []const u8) !void {
     var buffer: [512]u8 = undefined;
     var problem: Io.Writer = .fixed(&buffer);
-    try std.testing.expectError(error.InvalidConfig, parseConfig(std.testing.allocator, std.testing.io, config, "/tmp", &problem));
+    try std.testing.expectError(error.InvalidConfig, parseConfig(std.testing.allocator, config, "/tmp", &problem));
     try std.testing.expectEqualStrings(expected, problem.buffered());
 }
 
@@ -231,7 +226,7 @@ test "config parsing applies defaults and rejects invalid jobs" {
     var discard_buffer: [512]u8 = undefined;
     var discard: Io.Writer = .fixed(&discard_buffer);
     const valid = "{\"$schema\":\"./croner.schema.json\",\"jobs\":[{\"id\":\"sync\",\"schedule\":\"*/5 * * * *\",\"action\":{\"command\":{\"argv\":[\"echo\",\"\"],\"env\":{\"MODE\":\"test\"}}}}]}";
-    var parsed = try parseConfig(std.testing.allocator, std.testing.io, valid, "/tmp", &discard);
+    var parsed = try parseConfig(std.testing.allocator, valid, "/tmp", &discard);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.items.items.len);
     try std.testing.expectEqual(libcron.OverlapPolicy.skip, parsed.items.items[0].overlap);
@@ -245,7 +240,7 @@ test "config parsing applies defaults and rejects invalid jobs" {
     try expectProblem("job \"x\": env name \"BAD-NAME\" must be letters, digits and underscores, not starting with a digit", bad_env);
 
     const explicit = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"],\"cwd\":\"work\"}},\"overlap\":\"concurrent\"}]}";
-    var explicit_parsed = try parseConfig(std.testing.allocator, std.testing.io, explicit, "/tmp", &discard);
+    var explicit_parsed = try parseConfig(std.testing.allocator, explicit, "/tmp", &discard);
     defer explicit_parsed.deinit();
     try std.testing.expectEqual(libcron.OverlapPolicy.concurrent, explicit_parsed.items.items[0].overlap);
     try std.testing.expectEqualStrings("/tmp/work", explicit_parsed.items.items[0].cwd);
@@ -262,14 +257,14 @@ test "config parser rejects unknown fields and invalid schedules" {
     const one_job = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
     var discard_buffer: [512]u8 = undefined;
     var discard: Io.Writer = .fixed(&discard_buffer);
-    try std.testing.expectError(error.OutOfMemory, parseConfig(failing.allocator(), std.testing.io, one_job, "/tmp", &discard));
+    try std.testing.expectError(error.OutOfMemory, parseConfig(failing.allocator(), one_job, "/tmp", &discard));
 }
 
 test "job spec owns allocations made while it is initialized" {
     var discard_buffer: [512]u8 = undefined;
     var discard: Io.Writer = .fixed(&discard_buffer);
     var long_id: [8192]u8 = @splat('x');
-    var spec = try JobSpec.init(std.testing.allocator, std.testing.io, .{
+    var spec = try JobSpec.init(std.testing.allocator, .{
         .id = &long_id,
         .schedule = "* * * * *",
         .action = .{ .command = .{ .argv = &.{"true"} } },
