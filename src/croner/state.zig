@@ -1,4 +1,4 @@
-//! Where a config's daemon keeps its socket, lock and log.
+//! Where a config's daemon keeps its socket, lock, log and pause state.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,6 +15,7 @@ pub const StatePaths = struct {
     socket: []const u8,
     lock: []const u8,
     log: []const u8,
+    paused: []const u8,
 
     /// State lives under `$CRONER_HOME` (default `~/.croner`), keyed by the
     /// absolute config path so `--config` from any directory finds the daemon.
@@ -40,7 +41,9 @@ pub const StatePaths = struct {
         const lock = try std.fs.path.join(allocator, &.{ root, "daemon.lock" });
         errdefer allocator.free(lock);
         const log = try std.fs.path.join(allocator, &.{ root, "croner.log" });
-        return .{ .allocator = allocator, .root = root, .socket = socket, .lock = lock, .log = log };
+        errdefer allocator.free(log);
+        const paused = try std.fs.path.join(allocator, &.{ root, "paused.json" });
+        return .{ .allocator = allocator, .root = root, .socket = socket, .lock = lock, .log = log, .paused = paused };
     }
 
     pub fn deinit(self: *StatePaths) void {
@@ -48,6 +51,7 @@ pub const StatePaths = struct {
         self.allocator.free(self.socket);
         self.allocator.free(self.lock);
         self.allocator.free(self.log);
+        self.allocator.free(self.paused);
         self.* = undefined;
     }
 
@@ -65,6 +69,49 @@ pub fn acquireStateLock(io: Io, state: *const StatePaths) !Io.File {
         .lock_nonblocking = true,
         .permissions = .fromMode(0o600),
     });
+}
+
+/// Reads the ids of paused jobs; a missing file means none are paused.
+pub fn loadPaused(allocator: Allocator, io: Io, path: []const u8) !std.json.Parsed([]const []const u8) {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return std.json.parseFromSlice([]const []const u8, allocator, "[]", .{}),
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return std.json.parseFromSlice([]const []const u8, allocator, bytes, .{ .allocate = .alloc_always });
+}
+
+/// Replaces the paused-id file through a temporary file and a rename, so a
+/// crash leaves either the old or the new list.
+pub fn savePaused(allocator: Allocator, io: Io, path: []const u8, ids: []const []const u8) !void {
+    var bytes = Io.Writer.Allocating.init(allocator);
+    defer bytes.deinit();
+    try std.json.Stringify.value(ids, .{}, &bytes.writer);
+    var file = try Io.Dir.cwd().createFileAtomic(io, path, .{ .permissions = .fromMode(0o600), .replace = true });
+    defer file.deinit(io);
+    try file.file.writeStreamingAll(io, bytes.written());
+    try file.replace(io);
+}
+
+test "paused ids round trip through the state directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "paused.json" });
+    defer std.testing.allocator.free(path);
+
+    var missing = try loadPaused(std.testing.allocator, std.testing.io, path);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing.value.len);
+
+    try savePaused(std.testing.allocator, std.testing.io, path, &.{ "sync", "id with \"quotes\"\n" });
+    try savePaused(std.testing.allocator, std.testing.io, path, &.{ "backup", "id with \"quotes\"\n" });
+    var loaded = try loadPaused(std.testing.allocator, std.testing.io, path);
+    defer loaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), loaded.value.len);
+    try std.testing.expectEqualStrings("backup", loaded.value[0]);
+    try std.testing.expectEqualStrings("id with \"quotes\"\n", loaded.value[1]);
 }
 
 test "state paths live in the croner home, keyed by absolute config path" {

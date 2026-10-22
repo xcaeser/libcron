@@ -64,7 +64,7 @@ pub fn serve(init: std.process.Init, config_path: []const u8) !void {
     try redirectToLog(init.io, state.log);
     var problem_buffer: [1024]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    var daemon = Daemon.init(init.gpa, init.io, init.environ_map, config_path, &problem) catch |err| {
+    var daemon = Daemon.init(init.gpa, init.io, init.environ_map, config_path, state.paused, &problem) catch |err| {
         if (err == error.InvalidConfig) logEvent(init.io, "{s}", .{problem.buffered()});
         return err;
     };
@@ -278,11 +278,18 @@ fn observerNotify(context: ?*anyopaque, _: libcron.Invocation, outcome: libcron.
     logEvent(job.io, "{s} {f}", .{ job.spec.id, outcome });
 }
 
+fn contains(ids: []const []const u8, id: []const u8) bool {
+    for (ids) |candidate| if (std.mem.eql(u8, candidate, id)) return true;
+    return false;
+}
+
 const Daemon = struct {
     allocator: Allocator,
     io: Io,
     parent_env: *const std.process.Environ.Map,
     config_path: []const u8,
+    /// Ids of paused jobs, saved so pauses survive restarts. Borrowed.
+    paused_path: []const u8,
     jobs: std.ArrayList(*RuntimeJob),
 
     fn init(
@@ -290,6 +297,7 @@ const Daemon = struct {
         io: Io,
         parent_env: *const std.process.Environ.Map,
         config_path: []const u8,
+        paused_path: []const u8,
         problem: *Io.Writer,
     ) !Daemon {
         const config_absolute = try config.resolveFromCwd(allocator, io, config_path);
@@ -298,21 +306,37 @@ const Daemon = struct {
             .io = io,
             .parent_env = parent_env,
             .config_path = config_absolute,
+            .paused_path = paused_path,
             .jobs = .empty,
         };
         errdefer result.deinit();
         var specs = try config.loadConfig(allocator, io, result.config_path, problem);
         defer specs.deinit();
+        var paused = state_paths.loadPaused(allocator, io, paused_path) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => blk: {
+                logEvent(io, "starting every job: could not read {s}: {t}", .{ paused_path, err });
+                break :blk null;
+            },
+        };
+        defer if (paused) |*ids| ids.deinit();
+        const paused_ids: []const []const u8 = if (paused) |ids| ids.value else &.{};
         try result.jobs.ensureTotalCapacity(allocator, specs.items.items.len);
         for (specs.items.items) |*spec| {
             const runtime = try RuntimeJob.create(allocator, io, parent_env, spec.move());
-            runtime.start() catch |err| {
-                runtime.deinit();
-                return err;
-            };
             result.jobs.appendAssumeCapacity(runtime);
+            if (!contains(paused_ids, runtime.spec.id)) try runtime.start();
         }
         return result;
+    }
+
+    fn savePaused(self: *Daemon) !void {
+        var ids: std.ArrayList([]const u8) = .empty;
+        defer ids.deinit(self.allocator);
+        for (self.jobs.items) |job| {
+            if (job.state.load(.acquire) == .paused) try ids.append(self.allocator, job.spec.id);
+        }
+        try state_paths.savePaused(self.allocator, self.io, self.paused_path, ids.items);
     }
 
     fn deinit(self: *Daemon) void {
@@ -330,6 +354,7 @@ const Daemon = struct {
     fn setRunning(self: *Daemon, id: []const u8, running: bool) !void {
         const job = self.find(id) orelse return error.UnknownJob;
         if (running) try job.start() else job.stop();
+        try self.savePaused();
     }
 
     fn stopAll(self: *Daemon) void {
@@ -343,6 +368,7 @@ const Daemon = struct {
             job: *RuntimeJob,
             retained: bool = false,
             was_active: bool = false,
+            was_paused: bool = false,
         };
         var existing_by_id = std.StringHashMap(Existing).init(self.allocator);
         defer existing_by_id.deinit();
@@ -371,18 +397,23 @@ const Daemon = struct {
         }
         var existing_iterator = existing_by_id.valueIterator();
         while (existing_iterator.next()) |existing| {
+            existing.was_paused = existing.job.state.load(.acquire) == .paused;
             existing.was_active = !existing.retained and existing.job.state.load(.acquire) == .active;
             if (existing.was_active) existing.job.stop();
         }
-        for (created.items) |job| job.start() catch |err| {
-            for (created.items) |created_job| created_job.stop();
-            var restore_iterator = existing_by_id.valueIterator();
-            while (restore_iterator.next()) |existing| {
-                if (existing.was_active) existing.job.start() catch |restart_err|
-                    logEvent(self.io, "{s} failed to resume after reload: {t}", .{ existing.job.spec.id, restart_err });
-            }
-            return err;
-        };
+        for (created.items) |job| {
+            // A paused job stays paused when its definition changes.
+            if (existing_by_id.get(job.spec.id)) |existing| if (existing.was_paused) continue;
+            job.start() catch |err| {
+                for (created.items) |created_job| created_job.stop();
+                var restore_iterator = existing_by_id.valueIterator();
+                while (restore_iterator.next()) |existing| {
+                    if (existing.was_active) existing.job.start() catch |restart_err|
+                        logEvent(self.io, "{s} failed to resume after reload: {t}", .{ existing.job.spec.id, restart_err });
+                }
+                return err;
+            };
+        }
         var cleanup_iterator = existing_by_id.valueIterator();
         while (cleanup_iterator.next()) |existing| {
             if (!existing.retained) existing.job.deinit();
@@ -391,6 +422,7 @@ const Daemon = struct {
         self.jobs = next;
         created.deinit(self.allocator);
         specs.deinit();
+        self.savePaused() catch |err| logEvent(self.io, "could not save paused jobs: {t}", .{err});
     }
 
     fn status(self: *const Daemon, allocator: Allocator) ![]JobStatus {
@@ -415,7 +447,10 @@ test "daemon pause and reload reconcile by stable job id" {
     defer environ.deinit();
     var problem_buffer: [512]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    var daemon = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path, &problem);
+    const dir = std.fs.path.dirname(path).?;
+    const paused_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "paused.json" });
+    defer std.testing.allocator.free(paused_path);
+    var daemon = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path, paused_path, &problem);
     defer daemon.deinit();
 
     const keep = daemon.find("keep").?;
@@ -426,6 +461,8 @@ test "daemon pause and reload reconcile by stable job id" {
     try daemon.setRunning("keep", true);
     try std.testing.expect(keep.future != null);
     try daemon.setRunning("keep", false);
+    try daemon.setRunning("change", false);
+    try daemon.setRunning("remove", false);
 
     const invalid = "{\"jobs\":[{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}}]}";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "croner.json", .data = invalid });
@@ -440,8 +477,13 @@ test "daemon pause and reload reconcile by stable job id" {
     try std.testing.expect(daemon.find("keep").? == keep);
     try std.testing.expect(keep.future == null);
     try std.testing.expect(daemon.find("change").? != change);
-    try std.testing.expect(daemon.find("change").?.future != null);
+    try std.testing.expect(daemon.find("change").?.future == null);
     try std.testing.expect(daemon.find("remove") == null);
+    var saved = try state_paths.loadPaused(std.testing.allocator, std.testing.io, paused_path);
+    defer saved.deinit();
+    try std.testing.expectEqual(@as(usize, 2), saved.value.len);
+    try std.testing.expectEqualStrings("keep", saved.value[0]);
+    try std.testing.expectEqualStrings("change", saved.value[1]);
     const new_job = daemon.find("new").?;
     try std.testing.expect(new_job.future != null);
     try std.testing.expectEqualStrings("1", new_job.owned_environ.?.get("CRONER_TEST").?);
@@ -465,4 +507,11 @@ test "daemon pause and reload reconcile by stable job id" {
         try std.testing.expect(job.future == null);
         try std.testing.expectEqual(Status.paused, job.state.load(.acquire));
     }
+
+    // Shutting down pauses nothing on disk; a restart resumes what the user did not pause.
+    var restarted = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path, paused_path, &problem);
+    defer restarted.deinit();
+    try std.testing.expectEqual(Status.paused, restarted.find("keep").?.state.load(.acquire));
+    try std.testing.expectEqual(Status.paused, restarted.find("change").?.state.load(.acquire));
+    try std.testing.expectEqual(Status.active, restarted.find("new").?.state.load(.acquire));
 }

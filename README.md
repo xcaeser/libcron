@@ -136,9 +136,10 @@ the config's absolute path, so `--config` reaches the same daemon from any
 directory and the project directory stays clean.
 
 `logs` accepts `--lines <n>` and `--follow`. A reload leaves the daemon
-untouched when validation fails. Unchanged jobs retain their runner and pause
-state; changed, removed, and new jobs are reconciled by ID. Paused state is
-daemon-local and all configured jobs start active after a daemon restart.
+untouched when validation fails. Unchanged jobs keep their runner; changed,
+removed, and new jobs are reconciled by ID. Pauses follow the job ID and are
+saved in the state directory, so paused jobs stay paused across reloads,
+daemon restarts, crashes, and reboots.
 
 ### Configuration
 
