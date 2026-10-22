@@ -661,7 +661,7 @@ fn serve(init: std.process.Init, config_path: []const u8) !void {
         server.deinit(init.io);
         Io.Dir.deleteFileAbsolute(init.io, state.socket) catch {};
     }
-    std.debug.print("[croner] daemon started\n", .{});
+    logEvent(init.io, "daemon started", .{});
     const Event = union(enum) {
         server: anyerror!void,
         signal: anyerror!void,
@@ -676,7 +676,7 @@ fn serve(init: std.process.Init, config_path: []const u8) !void {
         .server => |result| result catch |err| if (err != error.Canceled) return err,
         .signal => {},
     }
-    std.debug.print("[croner] daemon stopped\n", .{});
+    logEvent(init.io, "daemon stopped", .{});
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -902,6 +902,24 @@ test "protocol messages round trip and log tail selects requested lines" {
     try std.testing.expectError(error.AlreadyRunning, listenState(std.testing.io, &state));
     server.deinit(std.testing.io);
     server = try listenState(std.testing.io, &state);
+}
+
+test "log lines name the UTC time and the outcome" {
+    var buffer: [128]u8 = undefined;
+    const cases = [_]struct { outcome: libcron.Outcome, text: []const u8 }{
+        .{ .outcome = .{ .command_terminated = .{ .exited = 7 } }, .text = "exit 7" },
+        .{ .outcome = .{ .command_terminated = .{ .signal = .KILL } }, .text = "signal KILL" },
+        .{ .outcome = .skipped_overlap, .text = "skipped (still running)" },
+        .{ .outcome = .{ .command_error = error.FileNotFound }, .text = "failed: FileNotFound" },
+    };
+    for (cases) |case| {
+        const line = try std.fmt.bufPrint(&buffer, "{f} sync {f}", .{
+            UtcTime{ .unix_seconds = 1792676225 },
+            OutcomeText{ .outcome = case.outcome },
+        });
+        try std.testing.expectEqualStrings("2026-10-22T13:37:05Z sync ", line[0..26]);
+        try std.testing.expectEqualStrings(case.text, line[26..]);
+    }
 }
 
 test "daemon pause and reload reconcile by stable job id" {
@@ -1267,10 +1285,67 @@ const RuntimeJob = struct {
     }
 };
 
-fn observerNotify(context: ?*anyopaque, invocation: libcron.Invocation, outcome: libcron.Outcome) void {
+fn observerNotify(context: ?*anyopaque, _: libcron.Invocation, outcome: libcron.Outcome) void {
     const job: *RuntimeJob = @ptrCast(@alignCast(context.?));
-    std.debug.print("[{s}] {s} at {d}\n", .{ job.spec.id, @tagName(outcome), invocation.scheduled_unix_minute });
+    logEvent(job.io, "{s} {f}", .{ job.spec.id, OutcomeText{ .outcome = outcome } });
 }
+
+/// Writes one line to the daemon log, which is the daemon's stderr.
+fn logEvent(io: Io, comptime format: []const u8, args: anytype) void {
+    const now = Io.Clock.real.now(io);
+    const unix_seconds: u64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
+    std.debug.print("{f} " ++ format ++ "\n", .{UtcTime{ .unix_seconds = unix_seconds }} ++ args);
+}
+
+/// ISO-8601 UTC time, for example `2026-10-22T13:37:05Z`.
+const UtcTime = struct {
+    unix_seconds: u64,
+
+    pub fn format(self: UtcTime, writer: *Io.Writer) Io.Writer.Error!void {
+        const epoch: std.time.epoch.EpochSeconds = .{ .secs = self.unix_seconds };
+        const year_day = epoch.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const day_seconds = epoch.getDaySeconds();
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+            year_day.year,
+            month_day.month.numeric(),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        });
+    }
+};
+
+const OutcomeText = struct {
+    outcome: libcron.Outcome,
+
+    pub fn format(self: OutcomeText, writer: *Io.Writer) Io.Writer.Error!void {
+        switch (self.outcome) {
+            .command_terminated => |term| switch (term) {
+                .exited => |code| try writer.print("exit {d}", .{code}),
+                .signal => |signal| try writer.print("signal {f}", .{SignalText{ .signal = signal }}),
+                .stopped => |signal| try writer.print("stopped by signal {f}", .{SignalText{ .signal = signal }}),
+                .unknown => |status| try writer.print("unknown wait status {d}", .{status}),
+            },
+            .command_error => |err| try writer.print("failed: {t}", .{err}),
+            .callback_success => try writer.writeAll("ok"),
+            .callback_error => |err| try writer.print("failed: {t}", .{err}),
+            .skipped_overlap => try writer.writeAll("skipped (still running)"),
+        }
+    }
+};
+
+const SignalText = struct {
+    signal: std.posix.SIG,
+
+    pub fn format(self: SignalText, writer: *Io.Writer) Io.Writer.Error!void {
+        if (std.enums.tagName(std.posix.SIG, self.signal)) |name|
+            try writer.writeAll(name)
+        else
+            try writer.print("{d}", .{@backingInt(self.signal)});
+    }
+};
 
 const Daemon = struct {
     allocator: Allocator,
@@ -1367,7 +1442,7 @@ const Daemon = struct {
             var restore_iterator = existing_by_id.valueIterator();
             while (restore_iterator.next()) |existing| {
                 if (existing.was_active) existing.job.start() catch |restart_err|
-                    std.debug.print("[{s}] failed to restore scheduler: {s}\n", .{ existing.job.spec.id, @errorName(restart_err) });
+                    logEvent(self.io, "{s} failed to resume after reload: {t}", .{ existing.job.spec.id, restart_err });
             }
             return err;
         };
