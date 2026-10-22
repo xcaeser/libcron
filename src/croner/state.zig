@@ -107,9 +107,13 @@ pub fn acquireStateLock(io: Io, state: *const StatePaths) !Io.File {
     });
 }
 
+/// How long a stopping daemon may hold its lock: longer than libcron's
+/// default 10 second termination grace for running commands.
+pub const stop_budget_seconds = 15;
+
 /// Waits until no daemon holds the state lock, so a successor can take it.
 pub fn waitForUnlock(io: Io, state: *const StatePaths) !void {
-    for (0..200) |_| {
+    for (0..stop_budget_seconds * 40) |_| {
         const lock = acquireStateLock(io, state) catch |err| switch (err) {
             error.WouldBlock => {
                 try Io.sleep(io, .fromMilliseconds(25), .awake);

@@ -56,16 +56,19 @@ fn loadConfigOrFail(ctx: zli.CommandContext, absolute_path: []const u8) !LoadedS
 }
 
 fn sendToDaemon(ctx: zli.CommandContext, message: Request) !void {
-    const app = appFor(ctx);
-    const config_path = ctx.flag("config", []const u8);
-    var state = try openState(ctx, config_path);
+    var state = try openState(ctx, ctx.flag("config", []const u8));
     defer state.deinit();
-    var response = protocol.request(app.allocator, app.io, &state, message) catch |err| switch (err) {
-        error.ConnectionRefused, error.FileNotFound => return fail(ctx, "croner is not running for {s}", .{config_path}),
-        else => return err,
-    };
+    var response = try requestOrFail(ctx, &state, message);
     defer response.deinit();
     try printResponse(ctx, &response);
+}
+
+fn requestOrFail(ctx: zli.CommandContext, state: *const StatePaths, message: Request) !std.json.Parsed(Response) {
+    const app = appFor(ctx);
+    return protocol.request(app.allocator, app.io, state, message) catch |err| switch (err) {
+        error.ConnectionRefused, error.FileNotFound => fail(ctx, "croner is not running for {s}", .{ctx.flag("config", []const u8)}),
+        else => err,
+    };
 }
 
 fn printResponse(ctx: zli.CommandContext, parsed: *const std.json.Parsed(Response)) !void {
@@ -141,7 +144,18 @@ fn commandStart(ctx: zli.CommandContext) !void {
 }
 
 fn commandStop(ctx: zli.CommandContext) !void {
-    try sendToDaemon(ctx, if (ctx.getArg("id")) |id| .{ .stop = id } else .shutdown);
+    if (ctx.getArg("id")) |id| return sendToDaemon(ctx, .{ .stop = id });
+    const app = appFor(ctx);
+    var state = try openState(ctx, ctx.flag("config", []const u8));
+    defer state.deinit();
+    var response = try requestOrFail(ctx, &state, .shutdown);
+    defer response.deinit();
+    // The daemon answers at once, then gives running jobs their grace to exit.
+    state_paths.waitForUnlock(app.io, &state) catch |err| switch (err) {
+        error.Timeout => return fail(ctx, "the daemon is still stopping after {d} seconds; see {s}", .{ state_paths.stop_budget_seconds, state.log }),
+        else => return err,
+    };
+    try printResponse(ctx, &response);
 }
 
 fn commandReload(ctx: zli.CommandContext) !void {
@@ -341,7 +355,7 @@ fn commandEnable(ctx: zli.CommandContext) !void {
         response.deinit();
     }
     state_paths.waitForUnlock(app.io, &state) catch |err| switch (err) {
-        error.Timeout => return fail(ctx, "the running daemon did not stop within 5 seconds", .{}),
+        error.Timeout => return fail(ctx, "the running daemon did not stop within {d} seconds", .{state_paths.stop_budget_seconds}),
         else => return err,
     };
     unit.install(app.allocator, app.io, text) catch |err| switch (err) {

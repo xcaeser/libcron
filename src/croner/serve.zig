@@ -63,6 +63,8 @@ pub fn serve(init: std.process.Init, config_path: []const u8) !void {
         if (err == error.InvalidConfig) logEvent(init.io, "{s}", .{problem.buffered()});
         return err;
     };
+    // Runs after the daemon's jobs have exited, just before the lock is released.
+    defer logEvent(init.io, "daemon stopped", .{});
     defer daemon.deinit();
     try daemon.start();
     var server = try protocol.listenState(init.io, &state);
@@ -85,7 +87,6 @@ pub fn serve(init: std.process.Init, config_path: []const u8) !void {
         .server => |result| result catch |err| if (err != error.Canceled) return err,
         .signal => {},
     }
-    logEvent(init.io, "daemon stopped", .{});
 }
 
 /// Points stdout and stderr, which jobs inherit, at the log, whoever launched the daemon.
@@ -143,7 +144,8 @@ fn handleRequest(daemon: *Daemon, stream: *Io.net.Stream, request_bytes: []const
             try sendMessage(stream, daemon.io, Response, .{ .ok = "reloaded" }, daemon.allocator);
         },
         .shutdown => {
-            daemon.shutdown();
+            // Reply first: stopping waits out the jobs' termination grace,
+            // longer than the client's request timeout.
             shutdown.* = true;
             try sendMessage(stream, daemon.io, Response, .{ .ok = "stopped" }, daemon.allocator);
         },
