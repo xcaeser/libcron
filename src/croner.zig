@@ -683,10 +683,10 @@ pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
     const allocator = init.gpa;
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_writer = Io.File.stdout().writer(init.io, &stdout_buffer);
+    var stdout_writer = Io.File.stdout().writerStreaming(init.io, &stdout_buffer);
     defer stdout_writer.interface.flush() catch {};
     var stdin_buffer: [4096]u8 = undefined;
-    var stdin_reader = Io.File.stdin().reader(init.io, &stdin_buffer);
+    var stdin_reader = Io.File.stdin().readerStreaming(init.io, &stdin_buffer);
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "_serve")) {
