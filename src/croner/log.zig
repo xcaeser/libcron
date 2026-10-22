@@ -3,29 +3,26 @@
 const std = @import("std");
 const Io = std.Io;
 
+const libcron = @import("libcron");
+
 /// Writes one line to the daemon log, which is the daemon's stderr.
 pub fn logEvent(io: Io, comptime format: []const u8, args: anytype) void {
     const now = Io.Clock.real.now(io);
-    const unix_seconds: u64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
+    const unix_seconds: i64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
     std.debug.print("{f} " ++ format ++ "\n", .{UtcTime{ .unix_seconds = unix_seconds }} ++ args);
 }
 
-/// ISO-8601 UTC time, for example `2026-10-22T13:37:05Z`.
+/// ISO-8601 UTC time with seconds, for example `2026-10-22T13:37:05Z`.
+/// libcron's `DateTime` format stops at the minute, so only its calendar
+/// fields are used.
 const UtcTime = struct {
-    unix_seconds: u64,
+    unix_seconds: i64,
 
     pub fn format(self: UtcTime, writer: *Io.Writer) Io.Writer.Error!void {
-        const epoch: std.time.epoch.EpochSeconds = .{ .secs = self.unix_seconds };
-        const year_day = epoch.getEpochDay().calculateYearDay();
-        const month_day = year_day.calculateMonthDay();
-        const day_seconds = epoch.getDaySeconds();
+        const time = libcron.TimeZone.utc.toLocal(self.unix_seconds) catch return writer.print("@{d}", .{self.unix_seconds});
         try writer.print("{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-            year_day.year,
-            month_day.month.numeric(),
-            month_day.day_index + 1,
-            day_seconds.getHoursIntoDay(),
-            day_seconds.getMinutesIntoHour(),
-            day_seconds.getSecondsIntoMinute(),
+            time.year, time.month.numeric(), time.day,
+            time.hour, time.minute,          @as(u8, @intCast(@mod(self.unix_seconds, 60))),
         });
     }
 };

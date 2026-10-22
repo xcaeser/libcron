@@ -38,10 +38,6 @@ pub fn jsonWrite(comptime T: type, value: T, allocator: Allocator) ![]u8 {
     return writer.toOwnedSlice();
 }
 
-fn readMessage(stream: *Io.net.Stream, io: Io, allocator: Allocator) ![]u8 {
-    return readMessageTimeout(stream, io, allocator, .none);
-}
-
 pub fn readMessageTimeout(stream: *Io.net.Stream, io: Io, allocator: Allocator, timeout: Io.Timeout) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
@@ -173,14 +169,14 @@ test "protocol messages round trip" {
     );
 
     try sendMessage(&client, std.testing.io, Request, .{ .start = "sync" }, std.testing.allocator);
-    const request_bytes = try readMessage(&peer, std.testing.io, std.testing.allocator);
+    const request_bytes = try readMessageTimeout(&peer, std.testing.io, std.testing.allocator, .none);
     defer std.testing.allocator.free(request_bytes);
     var request_parsed = try std.json.parseFromSlice(Request, std.testing.allocator, request_bytes, .{});
     defer request_parsed.deinit();
     try std.testing.expectEqualStrings("sync", request_parsed.value.start);
 
     try sendMessage(&peer, std.testing.io, Response, .{ .ok = "started" }, std.testing.allocator);
-    const response_bytes = try readMessage(&client, std.testing.io, std.testing.allocator);
+    const response_bytes = try readMessageTimeout(&client, std.testing.io, std.testing.allocator, .none);
     defer std.testing.allocator.free(response_bytes);
     var response_parsed = try std.json.parseFromSlice(Response, std.testing.allocator, response_bytes, .{});
     defer response_parsed.deinit();
@@ -200,7 +196,7 @@ test "protocol messages round trip" {
     };
     var write_future = try Io.concurrent(std.testing.io, WriteExactMessage.run, .{ &client, std.testing.io, payload });
     errdefer _ = write_future.cancel(std.testing.io) catch {};
-    const exact = try readMessage(&peer, std.testing.io, std.testing.allocator);
+    const exact = try readMessageTimeout(&peer, std.testing.io, std.testing.allocator, .none);
     defer std.testing.allocator.free(exact);
     try write_future.await(std.testing.io);
     try std.testing.expectEqualSlices(u8, payload, exact);
@@ -216,7 +212,7 @@ test "protocol messages round trip" {
     errdefer _ = oversized_future.cancel(std.testing.io) catch {};
     try std.testing.expectError(
         error.MessageTooLarge,
-        readMessage(&peer, std.testing.io, std.testing.allocator),
+        readMessageTimeout(&peer, std.testing.io, std.testing.allocator, .none),
     );
     try oversized_future.await(std.testing.io);
 
