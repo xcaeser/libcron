@@ -322,8 +322,6 @@ fn commandEnable(ctx: zli.CommandContext) !void {
     specs.deinit();
     var state = try openState(ctx, absolute);
     defer state.deinit();
-    // launchd opens the log before the daemon runs.
-    try state.ensure(app.io);
     var unit = try openUnit(ctx, &state);
     defer unit.deinit();
     const executable = try supervisor.executablePath(app.allocator, app.io, state.home);
@@ -340,7 +338,6 @@ fn commandEnable(ctx: zli.CommandContext) !void {
         .executable = executable,
         .config_path = absolute,
         .working_directory = std.fs.path.dirname(absolute) orelse "/",
-        .log_path = state.log,
         .environment = environment[0..environment_len],
     });
     defer app.allocator.free(text);

@@ -16,7 +16,6 @@ pub const Service = struct {
     executable: []const u8,
     config_path: []const u8,
     working_directory: []const u8,
-    log_path: []const u8,
     /// Variables the enabling shell had, such as PATH, so the daemon and its
     /// jobs see the same programs, state directory and zone database at login.
     environment: []const EnvVar,
@@ -185,7 +184,7 @@ fn writePlist(writer: *Io.Writer, service: Service) Io.Writer.Error!void {
         \\    <string>{f}</string>
         \\
     , .{ Xml{ .text = variable.name }, Xml{ .text = variable.value } });
-    try writer.print(
+    try writer.writeAll(
         \\  </dict>
         \\  <key>RunAtLoad</key>
         \\  <true/>
@@ -194,14 +193,10 @@ fn writePlist(writer: *Io.Writer, service: Service) Io.Writer.Error!void {
         \\    <key>SuccessfulExit</key>
         \\    <false/>
         \\  </dict>
-        \\  <key>StandardOutPath</key>
-        \\  <string>{f}</string>
-        \\  <key>StandardErrorPath</key>
-        \\  <string>{f}</string>
         \\</dict>
         \\</plist>
         \\
-    , .{ Xml{ .text = service.log_path }, Xml{ .text = service.log_path } });
+    );
 }
 
 fn writeSystemdUnit(writer: *Io.Writer, service: Service) Io.Writer.Error!void {
@@ -266,7 +261,6 @@ const test_service: Service = .{
     .executable = "/Users/me/.croner/bin/croner",
     .config_path = "/Users/me/R&D/100%/croner.json",
     .working_directory = "/Users/me/R&D/100%",
-    .log_path = "/Users/me/.croner/run/1f/croner.log",
     .environment = &.{
         .{ .name = "CRONER_HOME", .value = "/Users/me/.croner" },
         .{ .name = "PATH", .value = "/opt/$bin:/usr/bin" },
@@ -286,7 +280,6 @@ test "launchd plist runs the daemon at login and restarts it only after a crash"
         "<key>PATH</key>\n    <string>/opt/$bin:/usr/bin</string>",
         "<key>RunAtLoad</key>\n  <true/>",
         "<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>",
-        "<key>StandardErrorPath</key>\n  <string>/Users/me/.croner/run/1f/croner.log</string>",
     };
     for (expected_parts) |part| {
         if (std.mem.indexOf(u8, plist, part) == null) {
