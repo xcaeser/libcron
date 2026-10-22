@@ -5,7 +5,7 @@ const Io = std.Io;
 const builtin = @import("builtin");
 
 const commands = @import("croner/commands.zig");
-const daemon = @import("croner/daemon.zig");
+const serve = @import("croner/serve.zig");
 
 pub fn main(init: std.process.Init) !void {
     if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.UnsupportedOperatingSystem;
@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "_serve")) {
         if (args.len != 3) return error.InvalidArguments;
-        return daemon.serve(init, args[2]);
+        return serve.serve(init, args[2]);
     }
     var cli = try commands.buildCli(.{
         .io = init.io,
@@ -44,6 +44,7 @@ test {
     _ = @import("croner/state.zig");
     _ = @import("croner/protocol.zig");
     _ = @import("croner/log.zig");
-    _ = daemon;
+    _ = @import("croner/daemon.zig");
+    _ = serve;
     _ = commands;
 }
