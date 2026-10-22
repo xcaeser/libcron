@@ -147,6 +147,8 @@ pub fn savePaused(allocator: Allocator, io: Io, path: []const u8, ids: []const [
     var file = try Io.Dir.cwd().createFileAtomic(io, path, .{ .permissions = .fromMode(0o600), .replace = true });
     defer file.deinit(io);
     try file.file.writeStreamingAll(io, bytes.written());
+    // Without this a power loss can leave the renamed file empty.
+    try file.file.sync(io);
     try file.replace(io);
 }
 

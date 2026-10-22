@@ -80,6 +80,7 @@ pub const Unit = struct {
         });
         defer file.deinit(io);
         try file.file.writeStreamingAll(io, text);
+        try file.file.sync(io);
         try file.replace(io);
         if (builtin.os.tag == .macos) {
             const domain = try launchdTarget(allocator, null);
