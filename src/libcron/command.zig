@@ -54,8 +54,8 @@ pub fn dupe(command: Command, arena: std.mem.Allocator) std.mem.Allocator.Error!
 pub const RunError = std.process.SpawnError || std.process.Child.WaitError;
 
 /// Runs `command` until it exits. On cancellation its process group gets
-/// SIGTERM, then SIGKILL once `grace` has passed, and the command is reaped
-/// before `error.Canceled` is returned.
+/// SIGTERM, and whatever is left of the group SIGKILL once `grace` has
+/// passed; the command is reaped before `error.Canceled` is returned.
 pub fn run(command: Command, io: std.Io, grace: std.Io.Duration) RunError!Term {
     // Spawning is not interruptible: a canceled spawn could leave an
     // unreaped child behind.
@@ -91,10 +91,13 @@ fn terminate(io: std.Io, pid: posix.pid_t, grace: std.Io.Duration) void {
     signalGroup(pid, .TERM);
     const deadline = std.Io.Clock.Timestamp.fromNow(io, .{ .raw = grace, .clock = .awake });
     // ponytail: polls every 10ms; a pidfd or kqueue wait would wake at exit.
-    var reaped = reap(pid, .poll);
-    while (!reaped and deadline.compare(.gt, .now(io, .awake))) {
+    var reaped = false;
+    while (true) {
+        if (!reaped) reaped = reap(pid, .poll);
+        // The leader's children may still be cleaning up after it exits.
+        if (reaped and !groupAlive(pid)) return;
+        if (deadline.compare(.lte, .now(io, .awake))) break;
         io.sleep(.fromMilliseconds(10), .awake) catch unreachable;
-        reaped = reap(pid, .poll);
     }
     // The group id stays reserved while any member is alive, even after the
     // leader is reaped, so this cannot reach an unrelated process group.
@@ -104,6 +107,12 @@ fn terminate(io: std.Io, pid: posix.pid_t, grace: std.Io.Duration) void {
 
 fn signalGroup(pid: posix.pid_t, signal: posix.SIG) void {
     posix.kill(-pid, signal) catch {};
+}
+
+fn groupAlive(pid: posix.pid_t) bool {
+    // macOS answers EPERM while the group holds only a zombie.
+    posix.kill(-pid, @fromBackingInt(0)) catch |err| return err != error.ProcessNotFound;
+    return true;
 }
 
 /// Returns whether `pid` has exited and been reaped.
@@ -169,4 +178,37 @@ test "cancellation stops a command that ignores SIGTERM, with its process group"
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.ProcessGroupSurvived;
+}
+
+test "the grace period covers the whole group after its leader exits" {
+    if (!std.process.can_spawn or builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    var ready_buffer: [64]u8 = undefined;
+    const ready = try std.fmt.bufPrint(&ready_buffer, "/tmp/libcron-grace-{x}.ready", .{random});
+    var cleaned_buffer: [64]u8 = undefined;
+    const cleaned = try std.fmt.bufPrint(&cleaned_buffer, "/tmp/libcron-grace-{x}.cleaned", .{random});
+    defer std.Io.Dir.deleteFileAbsolute(io, ready) catch {};
+    defer std.Io.Dir.deleteFileAbsolute(io, cleaned) catch {};
+    // The leader dies on SIGTERM at once; its child needs a second to clean up.
+    var script_buffer: [256]u8 = undefined;
+    const script = try std.fmt.bufPrint(
+        &script_buffer,
+        "/bin/sh -c 'trap \"sleep 1; touch {s}; exit 0\" TERM; touch {s}; while :; do sleep 0.1; done'; true",
+        .{ cleaned, ready },
+    );
+
+    var future = try std.Io.concurrent(io, run, .{
+        Command{ .argv = &.{ "/bin/sh", "-c", script } },
+        io,
+        std.Io.Duration.fromSeconds(5),
+    });
+    for (0..500) |_| {
+        if (std.Io.Dir.accessAbsolute(io, ready, .{})) |_| break else |_| try io.sleep(.fromMilliseconds(10), .awake);
+    } else return error.CommandDidNotStart;
+
+    try std.testing.expectError(error.Canceled, future.cancel(io));
+    try std.Io.Dir.accessAbsolute(io, cleaned, .{});
 }
