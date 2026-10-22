@@ -981,22 +981,16 @@ test "protocol messages round trip and log tail selects requested lines" {
     server = try listenState(std.testing.io, &state);
 }
 
-test "log lines name the UTC time and the outcome" {
-    var buffer: [128]u8 = undefined;
-    const cases = [_]struct { outcome: libcron.Outcome, text: []const u8 }{
-        .{ .outcome = .{ .command_terminated = .{ .exited = 7 } }, .text = "exit 7" },
-        .{ .outcome = .{ .command_terminated = .{ .signal = .KILL } }, .text = "signal KILL" },
-        .{ .outcome = .skipped_overlap, .text = "skipped (still running)" },
-        .{ .outcome = .{ .command_error = error.FileNotFound }, .text = "failed: FileNotFound" },
-    };
-    for (cases) |case| {
-        const line = try std.fmt.bufPrint(&buffer, "{f} sync {f}", .{
-            UtcTime{ .unix_seconds = 1792676225 },
-            OutcomeText{ .outcome = case.outcome },
-        });
-        try std.testing.expectEqualStrings("2026-10-22T13:37:05Z sync ", line[0..26]);
-        try std.testing.expectEqualStrings(case.text, line[26..]);
-    }
+test "log timestamps are ISO-8601 UTC" {
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "2026-10-22T13:37:05Z",
+        try std.fmt.bufPrint(&buffer, "{f}", .{UtcTime{ .unix_seconds = 1792676225 }}),
+    );
+    try std.testing.expectEqualStrings(
+        "1970-01-01T00:00:00Z",
+        try std.fmt.bufPrint(&buffer, "{f}", .{UtcTime{ .unix_seconds = 0 }}),
+    );
 }
 
 test "daemon pause and reload reconcile by stable job id" {
@@ -1366,7 +1360,7 @@ const RuntimeJob = struct {
 
 fn observerNotify(context: ?*anyopaque, _: libcron.Invocation, outcome: libcron.Outcome) void {
     const job: *RuntimeJob = @ptrCast(@alignCast(context.?));
-    logEvent(job.io, "{s} {f}", .{ job.spec.id, OutcomeText{ .outcome = outcome } });
+    logEvent(job.io, "{s} {f}", .{ job.spec.id, outcome });
 }
 
 /// Writes one line to the daemon log, which is the daemon's stderr.
@@ -1393,36 +1387,6 @@ const UtcTime = struct {
             day_seconds.getMinutesIntoHour(),
             day_seconds.getSecondsIntoMinute(),
         });
-    }
-};
-
-const OutcomeText = struct {
-    outcome: libcron.Outcome,
-
-    pub fn format(self: OutcomeText, writer: *Io.Writer) Io.Writer.Error!void {
-        switch (self.outcome) {
-            .command_terminated => |term| switch (term) {
-                .exited => |code| try writer.print("exit {d}", .{code}),
-                .signal => |signal| try writer.print("signal {f}", .{SignalText{ .signal = signal }}),
-                .stopped => |signal| try writer.print("stopped by signal {f}", .{SignalText{ .signal = signal }}),
-                .unknown => |status| try writer.print("unknown wait status {d}", .{status}),
-            },
-            .command_error => |err| try writer.print("failed: {t}", .{err}),
-            .callback_success => try writer.writeAll("ok"),
-            .callback_error => |err| try writer.print("failed: {t}", .{err}),
-            .skipped_overlap => try writer.writeAll("skipped (still running)"),
-        }
-    }
-};
-
-const SignalText = struct {
-    signal: std.posix.SIG,
-
-    pub fn format(self: SignalText, writer: *Io.Writer) Io.Writer.Error!void {
-        if (std.enums.tagName(std.posix.SIG, self.signal)) |name|
-            try writer.writeAll(name)
-        else
-            try writer.print("{d}", .{@backingInt(self.signal)});
     }
 };
 
