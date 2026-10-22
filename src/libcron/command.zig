@@ -29,6 +29,25 @@ pub fn validate(command: Command) error{InvalidCommand}!void {
     }
 }
 
+/// Copies the argument, path, and environment strings into `arena`.
+pub fn dupe(command: Command, arena: std.mem.Allocator) std.mem.Allocator.Error!Command {
+    const argv = try arena.alloc([]const u8, command.argv.len);
+    for (argv, command.argv) |*copy, arg| copy.* = try arena.dupe(u8, arg);
+    const environ_map = if (command.environ_map) |map| environ: {
+        const copy = try arena.create(std.process.Environ.Map);
+        copy.* = try map.clone(arena);
+        break :environ copy;
+    } else null;
+    return .{
+        .argv = argv,
+        .cwd = switch (command.cwd) {
+            .path => |path| .{ .path = try arena.dupe(u8, path) },
+            .inherit, .dir => command.cwd,
+        },
+        .environ_map = environ_map,
+    };
+}
+
 pub const RunError = std.process.SpawnError || std.process.Child.WaitError;
 
 /// Runs `command` until it exits. On cancellation its process group gets

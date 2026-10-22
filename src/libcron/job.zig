@@ -64,7 +64,8 @@ pub const Outcome = union(enum) {
 };
 
 /// Receives results from scheduler and job tasks and therefore must be
-/// thread-safe.
+/// thread-safe. It is never called with the scheduler locked, so it may call
+/// `Scheduler` methods.
 pub const Observer = struct {
     context: ?*anyopaque = null,
     notify: *const fn (?*anyopaque, Invocation, Outcome) void,
@@ -73,9 +74,14 @@ pub const Observer = struct {
 pub const Job = struct {
     id: JobId,
     expression: Expression,
+    /// Command strings live in `arena`; callback contexts stay the caller's.
     task: Task,
     options: JobOptions,
-    active: std.atomic.Value(bool),
+    arena: std.heap.ArenaAllocator,
+    /// Invocations started and not finished. The job's memory is freed only
+    /// once this is zero, so a removed job's last invocation completes.
+    in_flight: std.atomic.Value(u32) = .init(0),
+    paused: bool = false,
     /// The latest wall-clock minute dispatched. It does not move back while
     /// the wall clock repeats after a DST change.
     wall_time: ?DateTime = null,
@@ -85,6 +91,19 @@ pub const Job = struct {
     /// ahead by less than three hours (spring-forward, late wake), a
     /// fixed-time job that matched any skipped minute runs once. Larger steps
     /// either way are taken as the new time without catching up.
+    /// Counts a new invocation, or returns false when the overlap policy
+    /// skips it because one is still running.
+    pub fn claim(self: *Job) bool {
+        if (self.options.overlap == .skip)
+            return self.in_flight.cmpxchgStrong(0, 1, .acquire, .monotonic) == null;
+        _ = self.in_flight.fetchAdd(1, .acquire);
+        return true;
+    }
+
+    pub fn release(self: *Job) void {
+        _ = self.in_flight.fetchSub(1, .release);
+    }
+
     pub fn due(self: *Job, local: DateTime) bool {
         const expression = self.expression;
         const matches = expression.matches(local) catch unreachable;
@@ -111,7 +130,8 @@ pub fn execute(
     invocation: Invocation,
     observer: ?Observer,
 ) std.Io.Cancelable!void {
-    defer if (job.options.overlap == .skip) job.active.store(false, .release);
+    // The job may be freed once released, so this runs last.
+    defer job.release();
     const started = std.Io.Clock.Timestamp.now(io, .boot);
 
     switch (job.task) {
