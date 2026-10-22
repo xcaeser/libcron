@@ -174,7 +174,9 @@ an implicit shell. Use an executable shebang or an explicit argv such as
 directory, and relative paths resolve from there. `env` overlays the daemon's
 inherited environment. `overlap` is `skip` or `concurrent` and defaults to
 `skip`. Unknown fields, malformed environment names, invalid schedules, and
-invalid commands are rejected before startup or reload.
+invalid commands are rejected before startup or reload, with a message that
+names the job and the field. `$schema` is editor metadata and may point
+anywhere.
 
 ## Syntax
 

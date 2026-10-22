@@ -73,41 +73,51 @@ const JobSpec = struct {
     env: []const EnvPair,
     overlap: libcron.OverlapPolicy,
 
-    fn init(gpa: Allocator, job: JobJson, config_dir: []const u8) !JobSpec {
+    /// On `error.InvalidConfig`, `problem` says which job and field are wrong.
+    fn init(gpa: Allocator, job: JobJson, config_dir: []const u8, problem: *Io.Writer) !JobSpec {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
-        if (job.id.len == 0 or std.mem.indexOfScalar(u8, job.id, 0) != null) return error.InvalidJobId;
+        if (job.id.len == 0 or std.mem.indexOfScalar(u8, job.id, 0) != null)
+            return reject(problem, "every job needs a nonempty id without NUL bytes", .{});
         const schedule = try a.dupe(u8, job.schedule);
-        const expression = libcron.Expression.parse(schedule) catch return error.InvalidSchedule;
+        const expression = libcron.Expression.parse(schedule) catch return reject(
+            problem,
+            "job \"{s}\": schedule \"{s}\" is not a cron expression (minute hour day-of-month month day-of-week)",
+            .{ job.id, job.schedule },
+        );
         const command = job.action.command;
-        if (command.argv.len == 0) return error.InvalidCommand;
         const argv = try a.alloc([]const u8, command.argv.len);
-        for (command.argv, 0..) |arg, i| {
-            if (arg.len == 0 or std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidCommand;
-            argv[i] = try a.dupe(u8, arg);
-        }
+        for (command.argv, argv) |arg, *copy| copy.* = try a.dupe(u8, arg);
+        const cwd = try std.fs.path.resolve(a, &.{ config_dir, command.cwd orelse "." });
 
-        const cwd_source = command.cwd orelse config_dir;
-        if (cwd_source.len == 0 or std.mem.indexOfScalar(u8, cwd_source, 0) != null) return error.InvalidCwd;
-        const cwd = if (std.fs.path.isAbsolute(cwd_source))
-            try a.dupe(u8, cwd_source)
-        else
-            try std.fs.path.resolve(a, &.{ config_dir, cwd_source });
+        // Scheduler.add owns the rules for a runnable command.
+        var check = libcron.Scheduler.init(a);
+        defer check.deinit();
+        _ = check.add(expression, .{ .command = .{ .argv = argv, .cwd = .{ .path = cwd } } }, .{}) catch |err| switch (err) {
+            error.InvalidCommand => return reject(
+                problem,
+                "job \"{s}\": action.command.argv needs a nonempty first element, and argv and cwd may not contain NUL bytes",
+                .{job.id},
+            ),
+            else => return err,
+        };
 
         const env_len = if (command.env) |env| env.map.count() else 0;
         const env = try a.alloc(EnvPair, env_len);
         if (command.env) |json_env| {
             var it = json_env.map.iterator();
             var i: usize = 0;
-            while (it.next()) |entry| {
-                if (!validEnvName(entry.key_ptr.*) or std.mem.indexOfScalar(u8, entry.value_ptr.*, 0) != null)
-                    return error.InvalidEnvironment;
-                env[i] = .{
-                    .key = try a.dupe(u8, entry.key_ptr.*),
-                    .value = try a.dupe(u8, entry.value_ptr.*),
-                };
-                i += 1;
+            while (it.next()) |entry| : (i += 1) {
+                const key = entry.key_ptr.*;
+                if (!validEnvName(key)) return reject(
+                    problem,
+                    "job \"{s}\": env name \"{s}\" must be letters, digits and underscores, not starting with a digit",
+                    .{ job.id, key },
+                );
+                if (std.mem.indexOfScalar(u8, entry.value_ptr.*, 0) != null)
+                    return reject(problem, "job \"{s}\": env value of {s} contains a NUL byte", .{ job.id, key });
+                env[i] = .{ .key = try a.dupe(u8, key), .value = try a.dupe(u8, entry.value_ptr.*) };
             }
         }
         std.sort.insertion(EnvPair, env, {}, struct {
@@ -168,19 +178,40 @@ const LoadedSpecs = struct {
     }
 };
 
-fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8) !LoadedSpecs {
-    if (bytes.len > max_config_bytes) return error.ConfigTooLarge;
-    var parsed = std.json.parseFromSlice(ConfigJson, allocator, bytes, .{
+/// Writes why the config was rejected and returns `error.InvalidConfig`.
+fn reject(problem: *Io.Writer, comptime format: []const u8, args: anytype) error{InvalidConfig} {
+    problem.print(format, args) catch {};
+    return error.InvalidConfig;
+}
+
+fn jsonProblem(err: anyerror) []const u8 {
+    return switch (err) {
+        error.UnknownField => "unknown field",
+        error.MissingField => "missing required field",
+        error.DuplicateField => "duplicate field",
+        error.InvalidEnumTag => "unknown value",
+        error.UnexpectedToken => "value has the wrong type",
+        else => "invalid JSON",
+    };
+}
+
+fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8, problem: *Io.Writer) !LoadedSpecs {
+    var scanner = std.json.Scanner.initCompleteInput(allocator, bytes);
+    defer scanner.deinit();
+    var diagnostics: std.json.Diagnostics = .{};
+    scanner.enableDiagnostics(&diagnostics);
+    var parsed = std.json.parseFromTokenSource(ConfigJson, allocator, &scanner, .{
         .allocate = .alloc_always,
         .duplicate_field_behavior = .@"error",
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidConfig,
+        else => return reject(problem, "line {d}, column {d}: {s}", .{
+            diagnostics.getLine(),
+            diagnostics.getColumn(),
+            jsonProblem(err),
+        }),
     };
     defer parsed.deinit();
-    if (parsed.value.@"$schema") |source| {
-        if (!std.mem.eql(u8, source, schema_url)) return error.InvalidSchema;
-    }
 
     var result: LoadedSpecs = .{ .allocator = allocator, .items = .empty };
     errdefer result.deinit();
@@ -189,19 +220,25 @@ fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8) 
     defer ids.deinit();
     try ids.ensureTotalCapacity(@intCast(parsed.value.jobs.len));
     for (parsed.value.jobs) |job| {
-        if ((ids.getOrPutAssumeCapacity(job.id)).found_existing) return error.DuplicateJobId;
-        var spec = try JobSpec.init(allocator, job, config_dir);
+        if ((ids.getOrPutAssumeCapacity(job.id)).found_existing)
+            return reject(problem, "job id \"{s}\" is used more than once", .{job.id});
+        var spec = try JobSpec.init(allocator, job, config_dir, problem);
         errdefer spec.deinit();
         result.items.appendAssumeCapacity(spec.move());
     }
     return result;
 }
 
-fn loadConfig(allocator: Allocator, io: Io, path: []const u8) !LoadedSpecs {
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_config_bytes));
+/// On `error.InvalidConfig`, `problem` holds a sentence naming the file and the fault.
+fn loadConfig(allocator: Allocator, io: Io, path: []const u8, problem: *Io.Writer) !LoadedSpecs {
+    const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_config_bytes)) catch |err| switch (err) {
+        error.FileNotFound => return reject(problem, "config file {s} not found; create one with `croner setup`", .{path}),
+        error.StreamTooLong => return reject(problem, "config file {s} is larger than 1 MiB", .{path}),
+        else => return err,
+    };
     defer allocator.free(bytes);
-    const config_dir = std.fs.path.dirname(path) orelse ".";
-    return parseConfig(allocator, bytes, config_dir);
+    problem.print("{s}: ", .{path}) catch {};
+    return parseConfig(allocator, bytes, std.fs.path.dirname(path) orelse ".", problem);
 }
 
 fn resolveFromCwd(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
@@ -288,14 +325,50 @@ fn appFor(ctx: zli.CommandContext) *App {
     return ctx.getContextData(App);
 }
 
+/// Prints a sentence for the user; `main` then exits with status 1 without repeating it.
+fn fail(ctx: zli.CommandContext, comptime format: []const u8, args: anytype) error{Reported} {
+    ctx.writer.print("error: " ++ format ++ "\n", args) catch {};
+    return error.Reported;
+}
+
+fn openState(ctx: zli.CommandContext, config_path: []const u8) !StatePaths {
+    const app = appFor(ctx);
+    return StatePaths.init(app.allocator, app.io, app.environ, config_path) catch |err| switch (err) {
+        error.HomeNotFound => fail(ctx, "HOME is not set; set HOME or CRONER_HOME", .{}),
+        error.CronerHomeNotAbsolute => fail(ctx, "CRONER_HOME must be an absolute path", .{}),
+        error.NameTooLong => fail(ctx, "the daemon socket path would exceed {d} bytes; set CRONER_HOME to a shorter directory", .{unix_socket_path_max}),
+        else => err,
+    };
+}
+
+fn loadConfigOrFail(ctx: zli.CommandContext, absolute_path: []const u8) !LoadedSpecs {
+    const app = appFor(ctx);
+    var problem_buffer: [1024]u8 = undefined;
+    var problem: Io.Writer = .fixed(&problem_buffer);
+    return loadConfig(app.allocator, app.io, absolute_path, &problem) catch |err| switch (err) {
+        error.InvalidConfig => fail(ctx, "{s}", .{problem.buffered()}),
+        else => err,
+    };
+}
+
+fn sendToDaemon(ctx: zli.CommandContext, message: Request) !void {
+    const app = appFor(ctx);
+    const config_path = ctx.flag("config", []const u8);
+    var state = try openState(ctx, config_path);
+    defer state.deinit();
+    var response = request(app.allocator, app.io, &state, message) catch |err| switch (err) {
+        error.ConnectionRefused, error.FileNotFound => return fail(ctx, "croner is not running for {s}", .{config_path}),
+        else => return err,
+    };
+    defer response.deinit();
+    try printResponse(ctx, &response);
+}
+
 fn printResponse(ctx: zli.CommandContext, parsed: *const std.json.Parsed(Response)) !void {
     switch (parsed.value) {
         .pid => return error.InvalidResponse,
         .ok => |message| try ctx.writer.print("{s}\n", .{message}),
-        .@"error" => |message| {
-            try ctx.writer.print("error: {s}\n", .{message});
-            return error.DaemonError;
-        },
+        .@"error" => |message| return fail(ctx, "{s}", .{message}),
         .jobs => |jobs| {
             try ctx.writer.print("ID\tSTATUS\tSCHEDULE\n", .{});
             for (jobs) |job| try ctx.writer.print("{s}\t{t}\t{s}\n", .{ job.id, job.status, job.schedule });
@@ -312,7 +385,7 @@ fn commandSetup(ctx: zli.CommandContext) !void {
     };
     if (existing) |file| {
         file.close(app.io);
-        return error.ConfigAlreadyExists;
+        return fail(ctx, "{s} already exists; edit it, or pass --config to create another", .{config_path});
     }
 
     const id = try prompt(ctx, "Job id: ");
@@ -325,14 +398,19 @@ fn commandSetup(ctx: zli.CommandContext) !void {
         .allocate = .alloc_always,
     }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidCommand,
+        else => return fail(ctx, "argv must be a JSON array of strings, for example [\"bun\", \"run\", \"sync\"]", .{}),
     };
     defer argv_parsed.deinit();
     const command = CommandJson{ .argv = argv_parsed.value };
     const job = JobJson{ .id = id, .schedule = schedule, .action = .{ .command = command } };
     const config = ConfigJson{ .@"$schema" = schema_url, .jobs = &.{job} };
     const config_dir = std.fs.path.dirname(config_path) orelse ".";
-    var checked = try JobSpec.init(app.allocator, job, config_dir);
+    var problem_buffer: [1024]u8 = undefined;
+    var problem: Io.Writer = .fixed(&problem_buffer);
+    var checked = JobSpec.init(app.allocator, job, config_dir, &problem) catch |err| switch (err) {
+        error.InvalidConfig => return fail(ctx, "{s}", .{problem.buffered()}),
+        else => return err,
+    };
     checked.deinit();
     const bytes = try jsonWrite(ConfigJson, config, app.allocator);
     defer app.allocator.free(bytes);
@@ -354,55 +432,36 @@ fn prompt(ctx: zli.CommandContext, text: []const u8) ![]const u8 {
 }
 
 fn commandStart(ctx: zli.CommandContext) !void {
-    const app = appFor(ctx);
-    const config_path = ctx.flag("config", []const u8);
-    if (ctx.getArg("id")) |id| {
-        var state = try StatePaths.init(app.allocator, app.io, app.environ, config_path);
-        defer state.deinit();
-        var response = try request(app.allocator, app.io, &state, .{ .start = id });
-        defer response.deinit();
-        return printResponse(ctx, &response);
-    }
-    try startBackground(app, config_path, ctx.writer);
+    if (ctx.getArg("id")) |id| return sendToDaemon(ctx, .{ .start = id });
+    try startBackground(ctx);
 }
 
 fn commandStop(ctx: zli.CommandContext) !void {
-    const app = appFor(ctx);
-    const config_path = ctx.flag("config", []const u8);
-    var state = try StatePaths.init(app.allocator, app.io, app.environ, config_path);
-    defer state.deinit();
-    const message: Request = if (ctx.getArg("id")) |id| .{ .stop = id } else .shutdown;
-    var response = try request(app.allocator, app.io, &state, message);
-    defer response.deinit();
-    try printResponse(ctx, &response);
+    try sendToDaemon(ctx, if (ctx.getArg("id")) |id| .{ .stop = id } else .shutdown);
 }
 
 fn commandReload(ctx: zli.CommandContext) !void {
-    const app = appFor(ctx);
-    var state = try StatePaths.init(app.allocator, app.io, app.environ, ctx.flag("config", []const u8));
-    defer state.deinit();
-    var response = try request(app.allocator, app.io, &state, .reload);
-    defer response.deinit();
-    try printResponse(ctx, &response);
+    try sendToDaemon(ctx, .reload);
 }
 
 fn commandList(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
     const config_path = ctx.flag("config", []const u8);
-    var state = try StatePaths.init(app.allocator, app.io, app.environ, config_path);
+    var state = try openState(ctx, config_path);
     defer state.deinit();
     var response = request(app.allocator, app.io, &state, .list) catch |err| switch (err) {
-        error.ConnectionRefused, error.FileNotFound => return printOffline(ctx, app, config_path),
+        error.ConnectionRefused, error.FileNotFound => return printOffline(ctx, config_path),
         else => return err,
     };
     defer response.deinit();
     try printResponse(ctx, &response);
 }
 
-fn printOffline(ctx: zli.CommandContext, app: *App, config_path: []const u8) !void {
+fn printOffline(ctx: zli.CommandContext, config_path: []const u8) !void {
+    const app = appFor(ctx);
     const absolute = try resolveFromCwd(app.allocator, app.io, config_path);
     defer app.allocator.free(absolute);
-    var specs = try loadConfig(app.allocator, app.io, absolute);
+    var specs = try loadConfigOrFail(ctx, absolute);
     defer specs.deinit();
     try ctx.writer.print("ID\tSTATUS\tSCHEDULE\n", .{});
     for (specs.items.items) |spec| try ctx.writer.print("{s}\t{t}\t{s}\n", .{ spec.id, Status.offline, spec.schedule });
@@ -410,10 +469,10 @@ fn printOffline(ctx: zli.CommandContext, app: *App, config_path: []const u8) !vo
 
 fn commandLogs(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
-    var state = try StatePaths.init(app.allocator, app.io, app.environ, ctx.flag("config", []const u8));
+    var state = try openState(ctx, ctx.flag("config", []const u8));
     defer state.deinit();
     const line_count = ctx.flag("lines", i32);
-    if (line_count < 0) return error.InvalidLines;
+    if (line_count < 0) return fail(ctx, "--lines must be zero or more", .{});
     const lines: usize = @intCast(line_count);
     var offset = try printLog(app, ctx.writer, state.log, lines);
     if (ctx.flag("follow", bool)) {
@@ -424,16 +483,18 @@ fn commandLogs(ctx: zli.CommandContext) !void {
     }
 }
 
-fn startBackground(app: *App, config_path: []const u8, writer: *Io.Writer) !void {
+fn startBackground(ctx: zli.CommandContext) !void {
+    const app = appFor(ctx);
+    const config_path = ctx.flag("config", []const u8);
     const absolute = try resolveFromCwd(app.allocator, app.io, config_path);
     defer app.allocator.free(absolute);
     const dir = std.fs.path.dirname(absolute) orelse ".";
-    var specs = try loadConfig(app.allocator, app.io, absolute);
+    var specs = try loadConfigOrFail(ctx, absolute);
     specs.deinit();
-    var state = try StatePaths.init(app.allocator, app.io, app.environ, absolute);
+    var state = try openState(ctx, absolute);
     defer state.deinit();
     try state.ensure(app.io);
-    if (try daemonSocketAvailable(app.io, &state)) return error.AlreadyRunning;
+    if (try daemonSocketAvailable(app.io, &state)) return fail(ctx, "croner is already running for {s}", .{config_path});
 
     var log = Io.Dir.cwd().createFile(app.io, state.log, .{
         .read = true,
@@ -502,20 +563,23 @@ fn startBackground(app: *App, config_path: []const u8, writer: *Io.Writer) !void
     try select.concurrent(.timeout, Io.sleep, .{ app.io, control_io_timeout.raw, control_io_timeout.clock });
     switch (try select.await()) {
         .ready => |result| {
-            try result;
+            result catch |err| switch (err) {
+                error.AlreadyRunning => return fail(ctx, "croner is already running for {s}", .{config_path}),
+                else => return err,
+            };
             started = true;
         },
         .child => |result| {
             _ = try result;
             child_owned = false;
-            return error.DaemonStartFailed;
+            return fail(ctx, "the daemon exited while starting; see {s}", .{state.log});
         },
         .timeout => |result| {
             try result;
-            return error.DaemonStartFailed;
+            return fail(ctx, "the daemon did not answer within 5 seconds; see {s}", .{state.log});
         },
     }
-    try writer.print("started\nlog: {s}\n", .{state.log});
+    try ctx.writer.print("started\nlog: {s}\n", .{state.log});
 }
 
 fn printLog(app: *App, writer: *Io.Writer, path: []const u8, lines: usize) !u64 {
@@ -654,7 +718,12 @@ fn serve(init: std.process.Init, config_path: []const u8) !void {
         else => return err,
     };
     defer state_lock.close(init.io);
-    var daemon = try Daemon.init(init.gpa, init.io, init.environ_map, config_path);
+    var problem_buffer: [1024]u8 = undefined;
+    var problem: Io.Writer = .fixed(&problem_buffer);
+    var daemon = Daemon.init(init.gpa, init.io, init.environ_map, config_path, &problem) catch |err| {
+        if (err == error.InvalidConfig) logEvent(init.io, "{s}", .{problem.buffered()});
+        return err;
+    };
     defer daemon.deinit();
     var server = try listenState(init.io, &state);
     defer {
@@ -704,16 +773,25 @@ pub fn main(init: std.process.Init) !void {
     var iterator = (std.process.Args{ .vector = arg_vector }).iterate();
     var app: App = .{ .allocator = allocator, .io = init.io, .environ = init.environ_map };
     cli.execute(&iterator, .{ .data = &app }) catch |err| {
-        if (err != error.DaemonError)
-            stdout_writer.interface.print("error: {s}\n", .{@errorName(err)}) catch {};
+        if (err != error.Reported)
+            stdout_writer.interface.print("error: {t}\n", .{err}) catch {};
         stdout_writer.interface.flush() catch {};
         std.process.exit(1);
     };
 }
 
+fn expectProblem(expected: []const u8, config: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    var problem: Io.Writer = .fixed(&buffer);
+    try std.testing.expectError(error.InvalidConfig, parseConfig(std.testing.allocator, config, "/tmp", &problem));
+    try std.testing.expectEqualStrings(expected, problem.buffered());
+}
+
 test "config parsing applies defaults and rejects invalid jobs" {
-    const valid = "{\"$schema\":\"https://xcaeser.github.io/croner/croner.schema.json\",\"jobs\":[{\"id\":\"sync\",\"schedule\":\"*/5 * * * *\",\"action\":{\"command\":{\"argv\":[\"echo\",\"ok\"],\"env\":{\"MODE\":\"test\"}}}}]}";
-    var parsed = try parseConfig(std.testing.allocator, valid, "/tmp");
+    var discard_buffer: [512]u8 = undefined;
+    var discard: Io.Writer = .fixed(&discard_buffer);
+    const valid = "{\"$schema\":\"./croner.schema.json\",\"jobs\":[{\"id\":\"sync\",\"schedule\":\"*/5 * * * *\",\"action\":{\"command\":{\"argv\":[\"echo\",\"\"],\"env\":{\"MODE\":\"test\"}}}}]}";
+    var parsed = try parseConfig(std.testing.allocator, valid, "/tmp", &discard);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.items.items.len);
     try std.testing.expectEqual(libcron.OverlapPolicy.skip, parsed.items.items[0].overlap);
@@ -721,42 +799,41 @@ test "config parsing applies defaults and rejects invalid jobs" {
     try std.testing.expectEqualStrings("test", parsed.items.items[0].env[0].value);
 
     const duplicate = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"]}}},{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"y\"]}}}]}";
-    try std.testing.expectError(error.DuplicateJobId, parseConfig(std.testing.allocator, duplicate, "/tmp"));
+    try expectProblem("job id \"x\" is used more than once", duplicate);
 
     const bad_env = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"],\"env\":{\"BAD-NAME\":\"x\"}}}}]}";
-    try std.testing.expectError(error.InvalidEnvironment, parseConfig(std.testing.allocator, bad_env, "/tmp"));
+    try expectProblem("job \"x\": env name \"BAD-NAME\" must be letters, digits and underscores, not starting with a digit", bad_env);
 
     const explicit = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"],\"cwd\":\"work\"}},\"overlap\":\"concurrent\"}]}";
-    var explicit_parsed = try parseConfig(std.testing.allocator, explicit, "/tmp");
+    var explicit_parsed = try parseConfig(std.testing.allocator, explicit, "/tmp", &discard);
     defer explicit_parsed.deinit();
     try std.testing.expectEqual(libcron.OverlapPolicy.concurrent, explicit_parsed.items.items[0].overlap);
     try std.testing.expectEqualStrings("/tmp/work", explicit_parsed.items.items[0].cwd);
 }
 
 test "config parser rejects unknown fields and invalid schedules" {
-    const unknown = "{\"jobs\":[],\"extra\":true}";
-    try std.testing.expectError(error.InvalidConfig, parseConfig(std.testing.allocator, unknown, "/tmp"));
+    try expectProblem("line 2, column 8: unknown field", "{\"jobs\":[],\n\"extra\":true}");
     const invalid_schedule = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"not cron\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
-    try std.testing.expectError(error.InvalidSchedule, parseConfig(std.testing.allocator, invalid_schedule, "/tmp"));
-    const invalid_schema = "{\"$schema\":\"https://example.com/schema.json\",\"jobs\":[]}";
-    try std.testing.expectError(error.InvalidSchema, parseConfig(std.testing.allocator, invalid_schema, "/tmp"));
+    try expectProblem("job \"x\": schedule \"not cron\" is not a cron expression (minute hour day-of-month month day-of-week)", invalid_schedule);
     const empty_argv = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[]}}}]}";
-    try std.testing.expectError(error.InvalidCommand, parseConfig(std.testing.allocator, empty_argv, "/tmp"));
-    const empty_cwd = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"],\"cwd\":\"\"}}}]}";
-    try std.testing.expectError(error.InvalidCwd, parseConfig(std.testing.allocator, empty_cwd, "/tmp"));
+    try expectProblem("job \"x\": action.command.argv needs a nonempty first element, and argv and cwd may not contain NUL bytes", empty_argv);
 
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     const one_job = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
-    try std.testing.expectError(error.OutOfMemory, parseConfig(failing.allocator(), one_job, "/tmp"));
+    var discard_buffer: [512]u8 = undefined;
+    var discard: Io.Writer = .fixed(&discard_buffer);
+    try std.testing.expectError(error.OutOfMemory, parseConfig(failing.allocator(), one_job, "/tmp", &discard));
 }
 
 test "job spec owns allocations made while it is initialized" {
+    var discard_buffer: [512]u8 = undefined;
+    var discard: Io.Writer = .fixed(&discard_buffer);
     var long_id: [8192]u8 = @splat('x');
     var spec = try JobSpec.init(std.testing.allocator, .{
         .id = &long_id,
         .schedule = "* * * * *",
         .action = .{ .command = .{ .argv = &.{"true"} } },
-    }, "/tmp");
+    }, "/tmp", &discard);
     defer spec.deinit();
     try std.testing.expectEqualStrings(&long_id, spec.id);
 }
@@ -931,7 +1008,9 @@ test "daemon pause and reload reconcile by stable job id" {
     defer std.testing.allocator.free(path);
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
-    var daemon = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path);
+    var problem_buffer: [512]u8 = undefined;
+    var problem: Io.Writer = .fixed(&problem_buffer);
+    var daemon = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path, &problem);
     defer daemon.deinit();
 
     const keep = daemon.find("keep").?;
@@ -945,14 +1024,14 @@ test "daemon pause and reload reconcile by stable job id" {
 
     const invalid = "{\"jobs\":[{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}}]}";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "croner.json", .data = invalid });
-    try std.testing.expectError(error.DuplicateJobId, daemon.reload());
+    try std.testing.expectError(error.InvalidConfig, daemon.reload(&problem));
     try std.testing.expect(daemon.find("keep").? == keep);
     try std.testing.expect(daemon.find("change").? == change);
     try std.testing.expect(keep.future == null);
 
     const updated = "{\"jobs\":[{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"change\",\"schedule\":\"*/2 * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"new\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"],\"env\":{\"CRONER_TEST\":\"1\"}}}}]}";
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "croner.json", .data = updated });
-    try daemon.reload();
+    try daemon.reload(&problem);
     try std.testing.expect(daemon.find("keep").? == keep);
     try std.testing.expect(keep.future == null);
     try std.testing.expect(daemon.find("change").? != change);
@@ -1141,27 +1220,20 @@ fn handleRequest(daemon: *Daemon, stream: *Io.net.Stream, request_bytes: []const
             defer daemon.allocator.free(statuses);
             try sendMessage(stream, daemon.io, Response, .{ .jobs = statuses }, daemon.allocator);
         },
-        .start => |id| {
-            daemon.setRunning(id, true) catch |err| {
-                const message = @errorName(err);
-                try sendMessage(stream, daemon.io, Response, .{ .@"error" = message }, daemon.allocator);
-                return;
+        .start, .stop => |id| {
+            const running = parsed.value == .start;
+            daemon.setRunning(id, running) catch |err| return switch (err) {
+                error.UnknownJob => sendError(daemon, stream, "no job \"{s}\" in {s}", .{ id, daemon.config_path }),
+                else => sendError(daemon, stream, "could not resume \"{s}\": {t}", .{ id, err }),
             };
-            try sendMessage(stream, daemon.io, Response, .{ .ok = "started" }, daemon.allocator);
-        },
-        .stop => |id| {
-            daemon.setRunning(id, false) catch |err| {
-                const message = @errorName(err);
-                try sendMessage(stream, daemon.io, Response, .{ .@"error" = message }, daemon.allocator);
-                return;
-            };
-            try sendMessage(stream, daemon.io, Response, .{ .ok = "stopped" }, daemon.allocator);
+            try sendMessage(stream, daemon.io, Response, .{ .ok = if (running) "started" else "stopped" }, daemon.allocator);
         },
         .reload => {
-            daemon.reload() catch |err| {
-                const message = @errorName(err);
-                try sendMessage(stream, daemon.io, Response, .{ .@"error" = message }, daemon.allocator);
-                return;
+            var problem_buffer: [1024]u8 = undefined;
+            var problem: Io.Writer = .fixed(&problem_buffer);
+            daemon.reload(&problem) catch |err| return switch (err) {
+                error.InvalidConfig => sendError(daemon, stream, "{s}", .{problem.buffered()}),
+                else => sendError(daemon, stream, "reload failed: {t}", .{err}),
             };
             try sendMessage(stream, daemon.io, Response, .{ .ok = "reloaded" }, daemon.allocator);
         },
@@ -1171,6 +1243,13 @@ fn handleRequest(daemon: *Daemon, stream: *Io.net.Stream, request_bytes: []const
             try sendMessage(stream, daemon.io, Response, .{ .ok = "stopped" }, daemon.allocator);
         },
     }
+}
+
+fn sendError(daemon: *Daemon, stream: *Io.net.Stream, comptime format: []const u8, args: anytype) !void {
+    var buffer: [1024]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    writer.print(format, args) catch {};
+    try sendMessage(stream, daemon.io, Response, .{ .@"error" = writer.buffered() }, daemon.allocator);
 }
 
 fn runServer(daemon: *Daemon, server: *Io.net.Server) !void {
@@ -1354,7 +1433,13 @@ const Daemon = struct {
     config_path: []const u8,
     jobs: std.ArrayList(*RuntimeJob),
 
-    fn init(allocator: Allocator, io: Io, parent_env: *const std.process.Environ.Map, config_path: []const u8) !Daemon {
+    fn init(
+        allocator: Allocator,
+        io: Io,
+        parent_env: *const std.process.Environ.Map,
+        config_path: []const u8,
+        problem: *Io.Writer,
+    ) !Daemon {
         const config_absolute = try resolveFromCwd(allocator, io, config_path);
         var result: Daemon = .{
             .allocator = allocator,
@@ -1364,7 +1449,7 @@ const Daemon = struct {
             .jobs = .empty,
         };
         errdefer result.deinit();
-        var specs = try loadConfig(allocator, io, result.config_path);
+        var specs = try loadConfig(allocator, io, result.config_path, problem);
         defer specs.deinit();
         try result.jobs.ensureTotalCapacity(allocator, specs.items.items.len);
         for (specs.items.items) |*spec| {
@@ -1399,8 +1484,8 @@ const Daemon = struct {
         for (self.jobs.items) |job| job.stop();
     }
 
-    fn reload(self: *Daemon) !void {
-        var specs = try loadConfig(self.allocator, self.io, self.config_path);
+    fn reload(self: *Daemon, problem: *Io.Writer) !void {
+        var specs = try loadConfig(self.allocator, self.io, self.config_path, problem);
         errdefer specs.deinit();
         const Existing = struct {
             job: *RuntimeJob,
