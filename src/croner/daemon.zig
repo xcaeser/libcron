@@ -82,23 +82,27 @@ pub const Daemon = struct {
             else => return err,
         };
         defer specs.deinit();
-        var paused = state_paths.loadPaused(allocator, io, paused_path) catch |err| switch (err) {
-            error.OutOfMemory => return err,
-            else => blk: {
-                logEvent(io, "starting every job: could not read {s}: {t}", .{ paused_path, err });
-                break :blk null;
-            },
-        };
+        var paused = try result.loadPaused();
         defer if (paused) |*ids| ids.deinit();
         const paused_ids: []const []const u8 = if (paused) |ids| ids.value else &.{};
         try result.entries.ensureTotalCapacity(allocator, specs.items.items.len);
         for (specs.items.items) |*spec| {
-            const job_id = try result.addJob(spec);
             const is_paused = contains(paused_ids, spec.id);
-            if (is_paused) _ = result.scheduler.pause(io, job_id);
+            const job_id = try result.addJob(spec, is_paused);
             result.entries.appendAssumeCapacity(.{ .spec = spec.move(), .job_id = job_id, .paused = is_paused });
         }
         return result;
+    }
+
+    /// The saved paused ids, or none, logged, when the file is unreadable.
+    fn loadPaused(self: *Daemon) !?std.json.Parsed([]const []const u8) {
+        return state_paths.loadPaused(self.allocator, self.io, self.paused_path) catch |err| switch (err) {
+            error.OutOfMemory => err,
+            else => {
+                logEvent(self.io, "pausing no job: could not read {s}: {t}", .{ self.paused_path, err });
+                return null;
+            },
+        };
     }
 
     pub fn deinit(self: *Daemon) void {
@@ -149,7 +153,7 @@ pub const Daemon = struct {
         logEvent(self.io, "{s} {f}", .{ self.names.get(invocation.job_id) orelse "?", outcome });
     }
 
-    fn addJob(self: *Daemon, spec: *const JobSpec) !libcron.JobId {
+    fn addJob(self: *Daemon, spec: *const JobSpec, paused: bool) !libcron.JobId {
         const name = try self.allocator.dupe(u8, spec.id);
         errdefer self.allocator.free(name);
         {
@@ -159,19 +163,40 @@ pub const Daemon = struct {
         }
         var environ: ?std.process.Environ.Map = null;
         defer if (environ) |*map| map.deinit();
-        if (spec.env.len > 0) {
-            environ = try self.parent_env.clone(self.allocator);
-            for (spec.env) |entry| try environ.?.put(entry.key, entry.value);
-        }
-        const job_id = try self.scheduler.add(self.io, spec.expression, .{ .command = .{
-            .argv = spec.argv,
-            .cwd = .{ .path = spec.cwd },
-            .environ_map = if (environ) |*map| map else self.parent_env,
-        } }, .{ .time_zone = spec.time_zone, .overlap = spec.overlap });
+        const job_id = try self.scheduler.add(self.io, spec.expression, try self.commandTask(spec, &environ), .{
+            .time_zone = spec.time_zone,
+            .overlap = spec.overlap,
+            .paused = paused,
+        });
         self.names_mutex.lockUncancelable(self.io);
         defer self.names_mutex.unlock(self.io);
         self.names.putAssumeCapacity(job_id, name);
         return job_id;
+    }
+
+    /// Gives job `job_id` the spec's schedule and command; it keeps its id
+    /// and its pause.
+    fn replaceJob(self: *Daemon, job_id: libcron.JobId, spec: *const JobSpec) !void {
+        var environ: ?std.process.Environ.Map = null;
+        defer if (environ) |*map| map.deinit();
+        _ = try self.scheduler.replace(self.io, job_id, spec.expression, try self.commandTask(spec, &environ), .{
+            .time_zone = spec.time_zone,
+            .overlap = spec.overlap,
+        });
+    }
+
+    /// The spec's command; `environ` holds its merged environment until the
+    /// scheduler has copied it.
+    fn commandTask(self: *Daemon, spec: *const JobSpec, environ: *?std.process.Environ.Map) !libcron.Task {
+        if (spec.env.len > 0) {
+            environ.* = try self.parent_env.clone(self.allocator);
+            for (spec.env) |entry| try environ.*.?.put(entry.key, entry.value);
+        }
+        return .{ .command = .{
+            .argv = spec.argv,
+            .cwd = .{ .path = spec.cwd },
+            .environ_map = if (environ.*) |*map| map else self.parent_env,
+        } };
     }
 
     fn indexOf(self: *const Daemon, id: []const u8) ?usize {
@@ -196,10 +221,12 @@ pub const Daemon = struct {
         try self.savePaused();
     }
 
-    /// Applies the config by job id: an unchanged job keeps its scheduler
-    /// job, a changed one is replaced and keeps its pause, a removed one is
-    /// removed, and a new one starts active. Replacements are added before
-    /// anything is removed, so a failed reload leaves the daemon as it was.
+    /// Applies the config by job id: an unchanged job is left alone, a
+    /// changed one is replaced in place and keeps its id and pause, a removed
+    /// one is removed, and a new one is added, paused if the saved paused ids
+    /// list it. New jobs are added first and removed again if anything fails;
+    /// replacements cannot be undone, so they come next, and only running out
+    /// of memory can stop them partway, with each entry updated as its job is.
     pub fn reload(self: *Daemon, problem: *Io.Writer) !void {
         var specs = config.loadConfig(self.allocator, self.io, self.parent_env, self.config_path, problem) catch |err| {
             if (err == error.InvalidConfig and self.problem != null) try self.setProblem(problem.buffered());
@@ -207,12 +234,15 @@ pub const Daemon = struct {
         };
         defer specs.deinit();
         const new_specs = specs.items.items;
-        const Change = union(enum) {
-            keep: usize,
-            add: struct { job_id: libcron.JobId, paused: bool },
+        var paused = try self.loadPaused();
+        defer if (paused) |*ids| ids.deinit();
+        const paused_ids: []const []const u8 = if (paused) |ids| ids.value else &.{};
+        const Target = union(enum) {
+            existing: usize,
+            added: struct { job_id: libcron.JobId, paused: bool },
         };
-        const changes = try self.allocator.alloc(Change, new_specs.len);
-        defer self.allocator.free(changes);
+        const targets = try self.allocator.alloc(Target, new_specs.len);
+        defer self.allocator.free(targets);
         const kept = try self.allocator.alloc(bool, self.entries.items.len);
         defer self.allocator.free(kept);
         @memset(kept, false);
@@ -220,31 +250,34 @@ pub const Daemon = struct {
         errdefer next.deinit(self.allocator);
 
         var planned: usize = 0;
-        errdefer for (changes[0..planned]) |change| switch (change) {
-            .keep => {},
-            .add => |added| _ = self.scheduler.remove(self.io, added.job_id),
+        errdefer for (targets[0..planned]) |target| switch (target) {
+            .existing => {},
+            .added => |added| _ = self.scheduler.remove(self.io, added.job_id),
         };
-        for (new_specs, changes) |*spec, *change| {
-            const old_index = self.indexOf(spec.id);
-            if (old_index) |index| {
-                if (self.entries.items[index].spec.eql(spec)) {
-                    change.* = .{ .keep = index };
-                    kept[index] = true;
-                    planned += 1;
-                    continue;
-                }
+        for (new_specs, targets) |*spec, *target| {
+            if (self.indexOf(spec.id)) |index| {
+                target.* = .{ .existing = index };
+                kept[index] = true;
+            } else {
+                const is_paused = contains(paused_ids, spec.id);
+                target.* = .{ .added = .{ .job_id = try self.addJob(spec, is_paused), .paused = is_paused } };
             }
-            const paused = if (old_index) |index| self.entries.items[index].paused else false;
-            const job_id = try self.addJob(spec);
-            // ponytail: dispatch could slip in before this pause at a minute boundary; JobOptions has no paused flag.
-            if (paused) _ = self.scheduler.pause(self.io, job_id);
-            change.* = .{ .add = .{ .job_id = job_id, .paused = paused } };
             planned += 1;
         }
+        for (new_specs, targets) |*spec, target| switch (target) {
+            .existing => |index| {
+                const entry = &self.entries.items[index];
+                if (entry.spec.eql(spec)) continue;
+                try self.replaceJob(entry.job_id, spec);
+                entry.spec.deinit();
+                entry.spec = spec.move();
+            },
+            .added => {},
+        };
 
-        for (new_specs, changes) |*spec, change| next.appendAssumeCapacity(switch (change) {
-            .keep => |index| self.entries.items[index],
-            .add => |added| .{ .spec = spec.move(), .job_id = added.job_id, .paused = added.paused },
+        for (new_specs, targets) |*spec, target| next.appendAssumeCapacity(switch (target) {
+            .existing => |index| self.entries.items[index],
+            .added => |added| .{ .spec = spec.move(), .job_id = added.job_id, .paused = added.paused },
         });
         for (self.entries.items, kept) |*entry, keep| {
             if (keep) continue;
@@ -271,6 +304,13 @@ pub const Daemon = struct {
         return result;
     }
 };
+
+/// Reads the scheduler's own flag: a job added or replaced paused must never
+/// be dispatchable, even for the instant before a separate `pause`.
+fn schedulerPaused(daemon: *const Daemon, job_id: libcron.JobId) bool {
+    for (daemon.scheduler.jobs.items) |job| if (job.id == job_id) return job.paused;
+    unreachable;
+}
 
 fn expectStatus(daemon: *const Daemon, id: []const u8, expected: Status) !void {
     const statuses = try daemon.status(std.testing.allocator);
@@ -321,14 +361,13 @@ test "one scheduler pauses, resumes and reloads jobs by id" {
     try daemon.reload(&problem);
     try std.testing.expectEqual(keep_id, daemon.entries.items[daemon.indexOf("keep").?].job_id);
     try expectStatus(&daemon, "keep", .paused);
-    const new_change_id = daemon.entries.items[daemon.indexOf("change").?].job_id;
-    try std.testing.expect(new_change_id != change_id);
+    // A changed job is replaced in place: same id, still paused.
+    try std.testing.expectEqual(change_id, daemon.entries.items[daemon.indexOf("change").?].job_id);
     try expectStatus(&daemon, "change", .paused);
+    try std.testing.expect(schedulerPaused(&daemon, change_id));
     try std.testing.expect(daemon.indexOf("remove") == null);
-    try expectStatus(&daemon, "new", .active);
-    // Replaced and removed jobs are gone from the scheduler.
-    try std.testing.expect(!daemon.scheduler.remove(io, change_id));
     try std.testing.expect(!daemon.scheduler.remove(io, remove_id));
+    try expectStatus(&daemon, "new", .active);
     var saved = try state_paths.loadPaused(std.testing.allocator, io, paused_path);
     defer saved.deinit();
     try std.testing.expectEqual(@as(usize, 2), saved.value.len);
@@ -348,6 +387,7 @@ test "one scheduler pauses, resumes and reloads jobs by id" {
 }
 
 test "an invalid config leaves the daemon up with no jobs until a reload succeeds" {
+    // A reload that adds a job the saved paused ids list adds it paused.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const io = std.testing.io;
@@ -356,6 +396,7 @@ test "an invalid config leaves the daemon up with no jobs until a reload succeed
     defer std.testing.allocator.free(path);
     const paused_path = try std.fs.path.join(std.testing.allocator, &.{ std.fs.path.dirname(path).?, "paused.json" });
     defer std.testing.allocator.free(paused_path);
+    try state_paths.savePaused(std.testing.allocator, io, paused_path, &.{"x"});
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
     var problem_buffer: [512]u8 = undefined;
@@ -370,5 +411,6 @@ test "an invalid config leaves the daemon up with no jobs until a reload succeed
     problem = .fixed(&problem_buffer);
     try daemon.reload(&problem);
     try std.testing.expect(daemon.problem == null);
-    try expectStatus(&daemon, "x", .active);
+    try expectStatus(&daemon, "x", .paused);
+    try std.testing.expect(schedulerPaused(&daemon, daemon.entries.items[0].job_id));
 }
