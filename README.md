@@ -193,7 +193,9 @@ the config's absolute path, so `--config` reaches the same daemon from any
 directory and the project directory stays clean.
 
 `logs` accepts `--lines <n>` and `--follow`. A reload leaves the daemon
-untouched when validation fails. Otherwise it compares jobs by ID: an
+untouched when validation fails. If the config is invalid when the daemon
+starts, at login for example, it runs no jobs and `croner list` shows the
+error until a `croner reload` succeeds. Otherwise it compares jobs by ID: an
 unchanged job keeps its schedule state, a changed job is replaced, a removed
 job is no longer scheduled (a run in progress finishes), and a new job starts
 active. A pause belongs to the ID, so a changed job that was paused stays

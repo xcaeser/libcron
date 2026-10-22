@@ -59,10 +59,7 @@ pub fn serve(init: std.process.Init, config_path: []const u8) !void {
     try redirectToLog(init.io, state.log);
     var problem_buffer: [1024]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    var daemon = Daemon.init(init.gpa, init.io, init.environ_map, config_path, state.paused, &problem) catch |err| {
-        if (err == error.InvalidConfig) logEvent(init.io, "{s}", .{problem.buffered()});
-        return err;
-    };
+    var daemon = try Daemon.init(init.gpa, init.io, init.environ_map, config_path, state.paused, &problem);
     // Runs after the daemon's jobs have exited, just before the lock is released.
     defer logEvent(init.io, "daemon stopped", .{});
     defer daemon.deinit();
@@ -122,6 +119,7 @@ fn handleRequest(daemon: *Daemon, stream: *Io.net.Stream, request_bytes: []const
             daemon.allocator,
         ),
         .list => {
+            if (daemon.problem) |text| return sendError(daemon, stream, "{s}; fix it and run croner reload", .{text});
             const statuses = try daemon.status(daemon.allocator);
             defer daemon.allocator.free(statuses);
             try sendMessage(stream, daemon.io, Response, .{ .jobs = statuses }, daemon.allocator);

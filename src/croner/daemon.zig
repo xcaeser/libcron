@@ -43,6 +43,10 @@ pub const Daemon = struct {
     names_mutex: Io.Mutex,
     run_future: ?Io.Future(libcron.RunError!void),
     running: std.atomic.Value(bool),
+    /// Why the config could not be loaded, while that leaves the daemon with
+    /// no jobs. The daemon stays up so `croner reload` can recover; a
+    /// service manager would otherwise restart it in a loop.
+    problem: ?[]u8,
 
     /// Loads the config and adds its jobs, paused as `paused_path` records.
     /// Call `start` once the daemon is at its final address.
@@ -67,9 +71,16 @@ pub const Daemon = struct {
             .names_mutex = .init,
             .run_future = null,
             .running = .init(false),
+            .problem = null,
         };
         errdefer result.deinit();
-        var specs = try config.loadConfig(allocator, io, parent_env, result.config_path, problem);
+        var specs = config.loadConfig(allocator, io, parent_env, result.config_path, problem) catch |err| switch (err) {
+            error.InvalidConfig => {
+                try result.setProblem(problem.buffered());
+                return result;
+            },
+            else => return err,
+        };
         defer specs.deinit();
         var paused = state_paths.loadPaused(allocator, io, paused_path) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -98,8 +109,16 @@ pub const Daemon = struct {
         var names = self.names.valueIterator();
         while (names.next()) |name| self.allocator.free(name.*);
         self.names.deinit(self.allocator);
+        if (self.problem) |text| self.allocator.free(text);
         self.allocator.free(self.config_path);
         self.* = undefined;
+    }
+
+    fn setProblem(self: *Daemon, text: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, text);
+        if (self.problem) |old| self.allocator.free(old);
+        self.problem = copy;
+        logEvent(self.io, "{s}; no jobs run until croner reload succeeds", .{text});
     }
 
     pub fn start(self: *Daemon) !void {
@@ -182,7 +201,10 @@ pub const Daemon = struct {
     /// removed, and a new one starts active. Replacements are added before
     /// anything is removed, so a failed reload leaves the daemon as it was.
     pub fn reload(self: *Daemon, problem: *Io.Writer) !void {
-        var specs = try config.loadConfig(self.allocator, self.io, self.parent_env, self.config_path, problem);
+        var specs = config.loadConfig(self.allocator, self.io, self.parent_env, self.config_path, problem) catch |err| {
+            if (err == error.InvalidConfig and self.problem != null) try self.setProblem(problem.buffered());
+            return err;
+        };
         defer specs.deinit();
         const new_specs = specs.items.items;
         const Change = union(enum) {
@@ -231,6 +253,10 @@ pub const Daemon = struct {
         }
         self.entries.deinit(self.allocator);
         self.entries = next;
+        if (self.problem) |text| {
+            self.allocator.free(text);
+            self.problem = null;
+        }
         self.savePaused() catch |err| logEvent(self.io, "could not save paused jobs: {t}", .{err});
     }
 
@@ -319,4 +345,30 @@ test "one scheduler pauses, resumes and reloads jobs by id" {
     try expectStatus(&restarted, "keep", .paused);
     try expectStatus(&restarted, "change", .paused);
     try expectStatus(&restarted, "new", .active);
+}
+
+test "an invalid config leaves the daemon up with no jobs until a reload succeeds" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "croner.json", .data = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"0 25 * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}}]}" });
+    const path = try tmp.dir.realPathFileAlloc(io, "croner.json", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const paused_path = try std.fs.path.join(std.testing.allocator, &.{ std.fs.path.dirname(path).?, "paused.json" });
+    defer std.testing.allocator.free(paused_path);
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    var problem_buffer: [512]u8 = undefined;
+    var problem: Io.Writer = .fixed(&problem_buffer);
+    var daemon = try Daemon.init(std.testing.allocator, io, &environ, path, paused_path, &problem);
+    defer daemon.deinit();
+    try daemon.start();
+    try std.testing.expectEqual(@as(usize, 0), daemon.entries.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, daemon.problem.?, "hour values must be within 0-23"));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "croner.json", .data = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"0 23 * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}}]}" });
+    problem = .fixed(&problem_buffer);
+    try daemon.reload(&problem);
+    try std.testing.expect(daemon.problem == null);
+    try expectStatus(&daemon, "x", .active);
 }
