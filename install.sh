@@ -2,7 +2,7 @@
 
 set -eu
 
-repo="xcaeser/croner"
+repo="xcaeser/libcron"
 croner_home=${CRONER_HOME:-$HOME/.croner}
 bin_dir=${CRONER_BIN_DIR:-$HOME/.local/bin}
 

@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 
 const libcron = @import("libcron");
 
-pub const schema_url = "https://xcaeser.github.io/croner/croner.schema.json";
+pub const schema_url = "https://xcaeser.github.io/libcron/croner.schema.json";
 const max_config_bytes = 1024 * 1024;
 
 const EnvJson = std.json.ArrayHashMap([]const u8);

@@ -1,22 +1,22 @@
 ### ⏱️ croner - cron scheduling for Zig.
 
-[Croner reference docs](https://xcaeser.github.io/croner)
+[Croner reference docs](https://xcaeser.github.io/libcron)
 
-[![Tests](https://github.com/xcaeser/croner/actions/workflows/main.yml/badge.svg)](https://github.com/xcaeser/croner/actions/workflows/main.yml)
+[![Tests](https://github.com/xcaeser/libcron/actions/workflows/main.yml/badge.svg)](https://github.com/xcaeser/libcron/actions/workflows/main.yml)
 [![Zig Version](https://img.shields.io/badge/Zig-0.17.0-orange.svg?logo=zig)](build.zig.zon)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/croner-v0.1.0-green)](https://github.com/xcaeser/croner/releases)
+[![Version](https://img.shields.io/badge/croner-v0.1.0-green)](https://github.com/xcaeser/libcron/releases)
 
 - [Library usage](#library-usage)
 
 ```sh
-   zig fetch --save=libcron https://github.com/xcaeser/croner/archive/v0.1.0.tar.gz
+   zig fetch --save=libcron https://github.com/xcaeser/libcron/archive/v0.1.0.tar.gz
 ```
 
 - [CLI usage](#cli-usage)
 
 ```sh
-   curl -fsSL https://raw.githubusercontent.com/xcaeser/croner/main/install.sh | sh
+   curl -fsSL https://raw.githubusercontent.com/xcaeser/libcron/main/install.sh | sh
 ```
 
 ## Features
@@ -40,7 +40,7 @@
 ### Add `libcron` to a project
 
 ```sh
-zig fetch --save=libcron https://github.com/xcaeser/croner/archive/v0.1.0.tar.gz
+zig fetch --save=libcron https://github.com/xcaeser/libcron/archive/v0.1.0.tar.gz
 ```
 
 Add the public `libcron` module to an executable or library:
@@ -176,7 +176,7 @@ formats as `2026-10-25 02:30`. `Expression.next` is exclusive and returns
 ### Install croner
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/xcaeser/croner/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/xcaeser/libcron/main/install.sh | sh
 ```
 
 The installer verifies the release checksum, stores the executable at
@@ -237,11 +237,11 @@ Runs missed while the machine was off are not caught up.
 ### Configuration
 
 The editor schema is published at
-<https://xcaeser.github.io/croner/croner.schema.json>.
+<https://xcaeser.github.io/libcron/croner.schema.json>.
 
 ```json
 {
-  "$schema": "https://xcaeser.github.io/croner/croner.schema.json",
+  "$schema": "https://xcaeser.github.io/libcron/croner.schema.json",
   "jobs": [
     {
       "id": "sync",

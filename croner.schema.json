@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://xcaeser.github.io/croner/croner.schema.json",
+  "$id": "https://xcaeser.github.io/libcron/croner.schema.json",
   "title": "Croner configuration",
   "description": "Jobs managed by the Croner background scheduler.",
   "type": "object",
