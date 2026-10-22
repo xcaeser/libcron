@@ -32,7 +32,8 @@ pub const RunError = std.Io.Cancelable || error{
 /// after `run` has returned.
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
-    /// Guards every field below, and each job's `wall` and `paused`.
+    /// Guards every field below, and every field of their jobs except
+    /// `in_flight`.
     mutex: std.Io.Mutex,
     /// Ordered by id. Each job is allocated on its own so running
     /// invocations keep a valid pointer after it is removed.
@@ -178,9 +179,7 @@ pub const Scheduler = struct {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const index = self.indexOf(id) orelse return false;
-        const job = self.jobs.items[index];
-        job.paused = false;
-        job.wall = .{};
+        self.jobs.items[index].paused = false;
         return true;
     }
 
@@ -266,10 +265,12 @@ pub const Scheduler = struct {
         const start = std.sort.partitionPoint(*Job, self.jobs.items, cursor.*, idBefore);
         for (self.jobs.items[start..]) |job| {
             cursor.* = @backingInt(job.id) + 1;
-            if (job.paused) continue;
             const local_time = job.options.time_zone.toLocal(unix_seconds) catch continue;
             job.seen = .{ .unix_seconds = unix_seconds, .local = local_time };
-            if (!job.wall.due(job.expression, local_time)) continue;
+            // A paused job's wall clock keeps running, so unpausing it inside
+            // a repeated hour does not rerun it and nothing is caught up.
+            const due = job.wall.due(job.expression, local_time);
+            if (job.paused or !due) continue;
             const invocation: Invocation = .{
                 .job_id = job.id,
                 .scheduled_unix_seconds = unix_seconds,
@@ -945,4 +946,20 @@ test "a job added paused does not run until unpaused" {
     scheduler.dispatchMinute(io, &group, 1, outcomes.observer());
     try group.await(io);
     try std.testing.expectEqual(1, outcomes.callback_success.load(.monotonic));
+}
+
+test "pausing inside a repeated hour does not rerun a fixed-time job" {
+    const io = std.testing.io;
+    const paris_tz = footerTz("CET-1CEST,M3.5.0,M10.5.0/3");
+    var clock = try TestClock.init("30 2 * * *", try TimeZone.fromTz(&paris_tz));
+    defer clock.deinit();
+    const id = clock.scheduler.jobs.items[0].id;
+    const fall = utcMinute(2026, .oct, 25, 1, 0);
+    // Through 02:04 in the second pass of 02:00-02:59.
+    try clock.dispatchRange(fall - 120, fall + 5);
+    try std.testing.expect(clock.scheduler.pause(io, id));
+    try clock.dispatch(fall + 5);
+    try std.testing.expect(clock.scheduler.unpause(io, id));
+    try clock.dispatchRange(fall + 6, fall + 120);
+    try std.testing.expectEqual(1, clock.fired());
 }
