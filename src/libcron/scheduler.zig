@@ -73,7 +73,7 @@ pub const Scheduler = struct {
         task: Task,
         options: JobOptions,
     ) AddError!JobId {
-        if (task == .command) try command.validate(task.command);
+        if (task == .command) try task.command.validate();
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         if (self.next_id == std.math.maxInt(u64)) return error.JobIdExhausted;

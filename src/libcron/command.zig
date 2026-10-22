@@ -10,24 +10,27 @@ pub const Command = struct {
     argv: []const []const u8,
     cwd: std.process.Child.Cwd = .inherit,
     environ_map: ?*const std.process.Environ.Map = null,
-};
 
-pub fn validate(command: Command) error{InvalidCommand}!void {
-    if (command.argv.len == 0 or command.argv[0].len == 0) return error.InvalidCommand;
-    for (command.argv) |arg| {
-        if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidCommand;
-    }
-    switch (command.cwd) {
-        .path => |path| if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null)
-            return error.InvalidCommand,
-        .inherit, .dir => {},
-    }
-    if (command.environ_map) |environ_map| {
-        for (environ_map.values()) |value| {
-            if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidCommand;
+    /// Rejects what `Scheduler.add` would: an empty argv or program name, an
+    /// empty working directory path, and NUL bytes in arguments, the path,
+    /// or environment values.
+    pub fn validate(self: Command) error{InvalidCommand}!void {
+        if (self.argv.len == 0 or self.argv[0].len == 0) return error.InvalidCommand;
+        for (self.argv) |arg| {
+            if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidCommand;
+        }
+        switch (self.cwd) {
+            .path => |path| if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null)
+                return error.InvalidCommand,
+            .inherit, .dir => {},
+        }
+        if (self.environ_map) |environ_map| {
+            for (environ_map.values()) |value| {
+                if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidCommand;
+            }
         }
     }
-}
+};
 
 /// Copies the argument, path, and environment strings into `arena`.
 pub fn dupe(command: Command, arena: std.mem.Allocator) std.mem.Allocator.Error!Command {
