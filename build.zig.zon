@@ -1,7 +1,7 @@
 .{
-    .name = .croner,
-    .version = "0.1.0",
-    .fingerprint = 0x3b3de175782df8aa,
+    .name = .libcron,
+    .version = "0.2.0",
+    .fingerprint = 0x2bfa5cb42a3f4279,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zli = .{

@@ -5,12 +5,12 @@
 [![Tests](https://github.com/xcaeser/libcron/actions/workflows/main.yml/badge.svg)](https://github.com/xcaeser/libcron/actions/workflows/main.yml)
 [![Zig Version](https://img.shields.io/badge/Zig-0.17.0-orange.svg?logo=zig)](build.zig.zon)
 [![License: MIT](https://img.shields.io/badge/License-MIT-lightgrey.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/croner-v0.1.0-green)](https://github.com/xcaeser/libcron/releases)
+[![Version](https://img.shields.io/badge/croner-v0.2.0-green)](https://github.com/xcaeser/libcron/releases)
 
 - [Library usage](#library-usage)
 
 ```sh
-   zig fetch --save=libcron https://github.com/xcaeser/libcron/archive/v0.1.0.tar.gz
+   zig fetch --save=libcron https://github.com/xcaeser/libcron/archive/v0.2.0.tar.gz
 ```
 
 - [CLI usage](#cli-usage)
@@ -40,7 +40,7 @@
 ### Add `libcron` to a project
 
 ```sh
-zig fetch --save=libcron https://github.com/xcaeser/libcron/archive/v0.1.0.tar.gz
+zig fetch --save=libcron https://github.com/xcaeser/libcron/archive/v0.2.0.tar.gz
 ```
 
 Add the public `libcron` module to an executable or library:

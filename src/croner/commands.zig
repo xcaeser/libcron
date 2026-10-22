@@ -422,7 +422,7 @@ pub fn buildCli(init: zli.InitOptions) !*zli.Command {
     const root = try zli.Command.init(init, .{
         .name = "croner",
         .description = "Cron jobs for Zig projects",
-        .version = .{ .major = 0, .minor = 1, .patch = 0 },
+        .version = .{ .major = 0, .minor = 2, .patch = 0 },
     }, commandHelp);
     errdefer root.deinit();
     try root.addFlag(.{

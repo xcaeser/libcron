@@ -1,6 +1,6 @@
 # Release Notes
 
-## Unreleased
+## v0.2.0
 
 ### libcron
 
@@ -38,7 +38,8 @@
   `$CRONER_HOME/run/<hash>/`, which also fixes `NameTooLong` from deep
   directories.
 - `croner enable` and `croner disable` start the daemon at login and restart
-  it after a crash through launchd or systemd user units.
+  it after a crash through launchd or systemd user units. The systemd path is
+  unit-tested and cross-compiled but has not yet run on a real Linux system.
 - Pauses survive daemon restarts, crashes, and reboots, and follow the job ID
   across reloads.
 - Jobs take an optional `time_zone`; UTC remains the default.
