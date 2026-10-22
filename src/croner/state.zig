@@ -71,9 +71,10 @@ pub const StatePaths = struct {
     }
 
     pub fn ensure(self: *const StatePaths, io: Io) !void {
-        var dir = try Io.Dir.cwd().createDirPathOpen(io, self.root, .{ .permissions = .fromMode(0o700) });
-        defer dir.close(io);
-        try dir.setPermissions(io, .fromMode(0o700));
+        // Set by path: a Dir handle must be opened with `iterate` for fchmod to
+        // work on Linux, where other handles are path-only.
+        _ = try Io.Dir.cwd().createDirPathStatus(io, self.root, .fromMode(0o700));
+        try Io.Dir.cwd().setFilePermissions(io, self.root, .fromMode(0o700), .{});
     }
 };
 
