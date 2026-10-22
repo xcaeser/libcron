@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const calendar = @import("calendar.zig");
+const command = @import("command.zig");
 const Expression = @import("expression.zig").Expression;
 const time_zone = @import("time_zone.zig");
 
@@ -27,20 +28,17 @@ pub const Callback = struct {
     run: *const fn (?*anyopaque, std.Io, Invocation) anyerror!void,
 };
 
-pub const Command = struct {
-    argv: []const []const u8,
-    cwd: std.process.Child.Cwd = .inherit,
-    environ_map: ?*const std.process.Environ.Map = null,
-};
-
 pub const Task = union(enum) {
     callback: Callback,
-    command: Command,
+    command: command.Command,
 };
 
 pub const JobOptions = struct {
     time_zone: TimeZone = .utc,
     overlap: OverlapPolicy = .skip,
+    /// How long a canceled command's process group has between SIGTERM and
+    /// SIGKILL.
+    termination_grace: std.Io.Duration = .fromSeconds(10),
 };
 
 /// What happened to one invocation. Durations are elapsed wall-clock time.
@@ -118,24 +116,7 @@ pub const Scheduler = struct {
         options: JobOptions,
     ) AddError!JobId {
         if (self.running) return error.Running;
-        if (task == .command) {
-            const command = task.command;
-            if (command.argv.len == 0 or command.argv[0].len == 0)
-                return error.InvalidCommand;
-            for (command.argv) |arg| {
-                if (std.mem.indexOfScalar(u8, arg, 0) != null) return error.InvalidCommand;
-            }
-            switch (command.cwd) {
-                .path => |path| if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null)
-                    return error.InvalidCommand,
-                .inherit, .dir => {},
-            }
-            if (command.environ_map) |environ_map| {
-                for (environ_map.values()) |value| {
-                    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidCommand;
-                }
-            }
-        }
+        if (task == .command) try command.validate(task.command);
         if (self.next_id == std.math.maxInt(u64)) return error.JobIdExhausted;
 
         const id: JobId = @fromBackingInt(self.next_id);
@@ -301,34 +282,12 @@ fn executeJob(
             };
             report(observer, invocation, .{ .callback_success = started.untilNow(io).raw });
         },
-        .command => |command| {
-            const previous_cancel_protection = io.swapCancelProtection(.blocked);
-            const child_result = std.process.spawn(io, .{
-                .argv = command.argv,
-                .cwd = command.cwd,
-                .environ_map = command.environ_map,
-                .stdin = .ignore,
-                .stdout = .inherit,
-                .stderr = .inherit,
-            });
-            _ = io.swapCancelProtection(previous_cancel_protection);
-
-            var child = child_result catch |err| {
+        .command => |spec| {
+            const term = command.run(spec, io, job.options.termination_grace) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 report(observer, invocation, .{ .command_error = err });
                 return;
             };
-            var kill_child = child;
-            defer kill_child.kill(io);
-
-            try io.checkCancel();
-
-            const term = child.wait(io) catch |err| {
-                if (err == error.Canceled) return error.Canceled;
-                report(observer, invocation, .{ .command_error = err });
-                return;
-            };
-            kill_child.id = null;
             report(observer, invocation, .{ .command_terminated = .{
                 .term = term,
                 .duration = started.untilNow(io).raw,

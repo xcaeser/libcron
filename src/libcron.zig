@@ -4,6 +4,7 @@
 //! a caller-provided `std.Io` for sleeping, concurrency, and child processes.
 
 const calendar = @import("libcron/calendar.zig");
+const command = @import("libcron/command.zig");
 const expression = @import("libcron/expression.zig");
 const time_zone = @import("libcron/time_zone.zig");
 const scheduler = @import("libcron/scheduler.zig");
@@ -22,7 +23,7 @@ pub const JobId = scheduler.JobId;
 pub const OverlapPolicy = scheduler.OverlapPolicy;
 pub const Invocation = scheduler.Invocation;
 pub const Callback = scheduler.Callback;
-pub const Command = scheduler.Command;
+pub const Command = command.Command;
 pub const Task = scheduler.Task;
 pub const JobOptions = scheduler.JobOptions;
 pub const Outcome = scheduler.Outcome;
@@ -33,6 +34,7 @@ pub const Scheduler = scheduler.Scheduler;
 
 test {
     _ = calendar;
+    _ = command;
     _ = expression;
     _ = time_zone;
     _ = scheduler;
