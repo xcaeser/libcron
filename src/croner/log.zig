@@ -2,11 +2,14 @@
 
 const std = @import("std");
 const Io = std.Io;
+const builtin = @import("builtin");
 
 const libcron = @import("libcron");
 
 /// Writes one line to the daemon log, which is the daemon's stderr.
 pub fn logEvent(io: Io, comptime format: []const u8, args: anytype) void {
+    // The test runner reports any stderr output as a failed command.
+    if (builtin.is_test) return;
     const now = Io.Clock.real.now(io);
     const unix_seconds: i64 = @intCast(@divFloor(now.nanoseconds, std.time.ns_per_s));
     std.debug.print("{f} " ++ format ++ "\n", .{UtcTime{ .unix_seconds = unix_seconds }} ++ args);
