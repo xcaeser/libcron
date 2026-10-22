@@ -27,7 +27,7 @@ jobs:
         uses: actions/configure-pages@v5
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1893+78e3b1c73
+          version: 0.17.0
       - name: Build documentation
         run: zig build docs
       - name: Upload artifact

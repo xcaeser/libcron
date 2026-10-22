@@ -2,12 +2,11 @@
     .name = .croner,
     .version = "0.1.0",
     .fingerprint = 0x3b3de175782df8aa,
-    .minimum_zig_version = "0.17.0-dev.1893+78e3b1c73",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zli = .{
-            .url = "https://github.com/xcaeser/zli/archive/v5.1.3.tar.gz",
-            .hash = "zli-5.1.3-LeUjpvkHAQCYj3r-wgQ2r1Gdkk-S61EFABfsXHP5Q4CH",
-            .lazy = true,
+            .url = "https://github.com/xcaeser/zli/archive/v6.0.0.tar.gz",
+            .hash = "zli-6.0.0-LeUjpinyAACejB0pe3yi8wdZa9qqLpJFjq49-RZGlS9A",
         },
     },
     .paths = .{

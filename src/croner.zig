@@ -974,10 +974,10 @@ fn readMessageTimeout(stream: *Io.net.Stream, io: Io, allocator: Allocator, time
     while (true) {
         const read_len = @min(chunk.len, max_message_bytes - result.items.len + 1);
         var data = [_][]u8{chunk[0..read_len]};
-        const count = try (try io.operateTimeout(.{ .net_read = .{
+        const count = (try (try io.operateTimeout(.{ .net_read = .{
             .socket_handle = stream.socket.handle,
             .data = &data,
-        } }, timeout)).net_read;
+        } }, timeout)).net_read).data_len;
         if (count == 0) return error.EndOfStream;
         const bytes = chunk[0..count];
         if (std.mem.indexOfScalar(u8, bytes, '\n')) |index| {
