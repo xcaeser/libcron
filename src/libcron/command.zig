@@ -57,10 +57,14 @@ pub const RunError = std.process.SpawnError || std.process.Child.WaitError;
 /// SIGTERM, and whatever is left of the group SIGKILL once `grace` has
 /// passed; the command is reaped before `error.Canceled` is returned.
 pub fn run(command: Command, io: std.Io, grace: std.Io.Duration) RunError!Term {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const exe = try executable(command, io, &path_buffer);
+
     // Spawning is not interruptible: a canceled spawn could leave an
     // unreaped child behind.
     const protection = io.swapCancelProtection(.blocked);
     const spawned = std.process.spawn(io, .{
+        .exe = exe,
         .argv = command.argv,
         .cwd = command.cwd,
         .environ_map = command.environ_map,
@@ -82,6 +86,35 @@ pub fn run(command: Command, io: std.Io, grace: std.Io.Duration) RunError!Term {
         if (err == error.Canceled) terminate(io, pid, grace);
         return err;
     };
+}
+
+/// std looks a program name without a slash up on the daemon's `PATH`. A
+/// command whose environment sets `PATH` looks it up there instead, with
+/// relative entries taken from the directory the command runs in.
+fn executable(command: Command, io: std.Io, buffer: []u8) RunError!std.process.ReplaceOptions.Exe {
+    const name = command.argv[0];
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return .detect;
+    const environ_map = command.environ_map orelse return .detect;
+    const search_path = environ_map.get("PATH") orelse return .detect;
+    const base: std.Io.Dir, const prefix: []const u8 = switch (command.cwd) {
+        .inherit => .{ .cwd(), "" },
+        .dir => |dir| .{ dir, "" },
+        .path => |path| .{ .cwd(), path },
+    };
+    var directories = std.mem.tokenizeScalar(u8, search_path, ':');
+    while (directories.next()) |directory| {
+        const candidate = if (prefix.len == 0 or std.fs.path.isAbsolute(directory))
+            std.fmt.bufPrint(buffer, "{s}/{s}", .{ directory, name })
+        else
+            std.fmt.bufPrint(buffer, "{s}/{s}/{s}", .{ prefix, directory, name });
+        const path = candidate catch continue;
+        base.access(io, path, .{ .execute = true }) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => continue,
+        };
+        return .{ .explicit = .{ .dir = base, .path = path } };
+    }
+    return error.FileNotFound;
 }
 
 fn terminate(io: std.Io, pid: posix.pid_t, grace: std.Io.Duration) void {
@@ -211,4 +244,36 @@ test "the grace period covers the whole group after its leader exits" {
 
     try std.testing.expectError(error.Canceled, future.cancel(io));
     try std.Io.Dir.accessAbsolute(io, cleaned, .{});
+}
+
+test "a bare program name is found on the command's own PATH" {
+    if (!std.process.can_spawn or builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    var directory_buffer: [64]u8 = undefined;
+    const directory = try std.fmt.bufPrint(&directory_buffer, "/tmp/libcron-path-{x}", .{random});
+    try std.Io.Dir.cwd().createDirPath(io, directory);
+    defer std.Io.Dir.cwd().deleteTree(io, directory) catch {};
+    var tool_buffer: [96]u8 = undefined;
+    const tool = try std.fmt.bufPrint(&tool_buffer, "{s}/libcron-test-tool", .{directory});
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = tool,
+        .data = "#!/bin/sh\nexit 42\n",
+        .flags = .{ .permissions = .executable_file },
+    });
+
+    var environ = std.process.Environ.Map.init(std.testing.allocator);
+    defer environ.deinit();
+    var path_buffer: [128]u8 = undefined;
+    try environ.put("PATH", try std.fmt.bufPrint(&path_buffer, "/usr/bin:{s}:/bin", .{directory}));
+    const found = try run(.{ .argv = &.{"libcron-test-tool"}, .environ_map = &environ }, io, .fromSeconds(1));
+    try std.testing.expectEqual(Term{ .exited = 42 }, found);
+
+    try environ.put("PATH", "/usr/bin:/bin");
+    try std.testing.expectError(
+        error.FileNotFound,
+        run(.{ .argv = &.{"libcron-test-tool"}, .environ_map = &environ }, io, .fromSeconds(1)),
+    );
 }
