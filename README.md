@@ -195,6 +195,7 @@ To build from source, run `zig build`; the executable is written to
 | `croner stop <id>`  | Pause future runs; a run in progress finishes.           |
 | `croner stop`       | Shut down the daemon and all jobs.                       |
 | `croner list`       | Show jobs as `active`, `paused`, or `offline`.           |
+| `croner next [id]`  | Show each job's next 5 fire times in its time zone.      |
 | `croner reload`     | Validate and reconcile the config by stable job ID.      |
 | `croner logs`       | Show the latest 100 combined log lines.                  |
 | `croner enable`     | Start the daemon at login and restart it after a crash.  |
@@ -203,18 +204,22 @@ To build from source, run `zig build`; the executable is written to
 
 Each config gets its own daemon. Its socket, lock, log, and pause state live in
 `~/.croner/run/<hash>/` (or `$CRONER_HOME/run/<hash>/`), where the hash is of
-the config's absolute path, so `--config` reaches the same daemon from any
-directory and the project directory stays clean.
+the config file's real path, so `--config` reaches the same daemon from any
+directory or through any symlink, and the project directory stays clean.
 
-`logs` accepts `--lines <n>` and `--follow`. A reload leaves the daemon
-untouched when validation fails. If the config is invalid when the daemon
-starts, at login for example, it runs no jobs and `croner list` shows the
-error until a `croner reload` succeeds. Otherwise it compares jobs by ID: an
-unchanged job keeps its schedule state, a changed job is replaced, a removed
-job is no longer scheduled (a run in progress finishes), and a new job starts
-active. A pause belongs to the ID, so a changed job that was paused stays
-paused. Paused IDs are saved in the state directory, so they stay paused
-across daemon restarts, crashes, and reboots.
+`next` accepts `--count <n>` and works from the config alone; with the daemon
+running it also marks paused jobs. It shows scheduled times across DST changes
+and does not predict runs skipped by `overlap` or catch-up runs after a clock
+jump. `logs` accepts `--lines <n>` and `--follow`.
+
+A reload leaves the daemon untouched when validation fails. Otherwise it
+compares jobs by ID: an unchanged job is left alone, a changed job is replaced
+in place, a removed job is no longer scheduled (a run in progress finishes),
+and a new job starts active. A pause belongs to the ID, so a changed job that
+was paused stays paused. Paused IDs are saved in the state directory, so they
+stay paused across daemon restarts, crashes, and reboots. If the config is
+invalid when the daemon starts, at login for example, it runs no jobs and
+`croner list` shows the error until a `croner reload` succeeds.
 
 ### Run at login
 

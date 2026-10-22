@@ -18,6 +18,7 @@ const state_paths = @import("state.zig");
 const StatePaths = state_paths.StatePaths;
 const log = @import("log.zig");
 const supervisor = @import("supervisor.zig");
+const next = @import("next.zig");
 
 pub const App = struct {
     allocator: Allocator,
@@ -173,6 +174,42 @@ fn commandList(ctx: zli.CommandContext) !void {
     };
     defer response.deinit();
     try printResponse(ctx, &response);
+}
+
+fn commandNext(ctx: zli.CommandContext) !void {
+    const app = appFor(ctx);
+    const count = ctx.flag("count", i32);
+    if (count < 1) return fail(ctx, "--count must be at least 1", .{});
+    const absolute = try config.resolveFromCwd(app.allocator, app.io, ctx.flag("config", []const u8));
+    defer app.allocator.free(absolute);
+    var specs = try loadConfigOrFail(ctx, absolute);
+    defer specs.deinit();
+    var selected: []const JobSpec = specs.items.items;
+    if (ctx.getArg("id")) |id| {
+        const index = for (selected, 0..) |spec, i| {
+            if (std.mem.eql(u8, spec.id, id)) break i;
+        } else return fail(ctx, "no job \"{s}\" in {s}", .{ id, absolute });
+        selected = selected[index..][0..1];
+    }
+
+    // Only a running daemon knows which jobs are paused.
+    var state = try openState(ctx, absolute);
+    defer state.deinit();
+    var response: ?std.json.Parsed(Response) = protocol.request(app.allocator, app.io, &state, .list) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => null,
+    };
+    defer if (response) |*parsed| parsed.deinit();
+    var paused: std.ArrayList([]const u8) = .empty;
+    defer paused.deinit(app.allocator);
+    if (response) |parsed| switch (parsed.value) {
+        .jobs => |jobs| for (jobs) |job| {
+            if (job.status == .paused) try paused.append(app.allocator, job.id);
+        },
+        else => {},
+    };
+    const now: i64 = @intCast(@divFloor(Io.Clock.real.now(app.io).nanoseconds, std.time.ns_per_s));
+    try next.writeNext(ctx.writer, selected, @intCast(count), now, paused.items);
 }
 
 fn printOffline(ctx: zli.CommandContext, config_path: []const u8) !void {
@@ -402,6 +439,9 @@ pub fn buildCli(init: zli.InitOptions) !*zli.Command {
     const stop = try addCommand(root, init, "stop", "Stop the daemon or pause a job", commandStop);
     try stop.addPositionalArg(.{ .name = "id", .description = "Job id", .required = false });
     _ = try addCommand(root, init, "list", "List configured jobs", commandList);
+    const next_command = try addCommand(root, init, "next", "Show when jobs fire next", commandNext);
+    try next_command.addPositionalArg(.{ .name = "id", .description = "Job id", .required = false });
+    try next_command.addFlag(.{ .name = "count", .description = "Fire times per job", .type = .Int, .default_value = .{ .Int = 5 } });
     _ = try addCommand(root, init, "reload", "Reload the configuration", commandReload);
     _ = try addCommand(root, init, "enable", "Start the daemon at login and after a crash", commandEnable);
     _ = try addCommand(root, init, "disable", "Undo enable and stop the daemon", commandDisable);

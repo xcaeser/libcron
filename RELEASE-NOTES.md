@@ -42,6 +42,8 @@
 - Pauses survive daemon restarts, crashes, and reboots, and follow the job ID
   across reloads.
 - Jobs take an optional `time_zone`; UTC remains the default.
+- `croner next [id] [--count n]` shows each job's next fire times with their
+  UTC offsets, computed the way the scheduler handles DST changes.
 - One scheduler runs every job, and `reload` compares jobs by ID: unchanged
   jobs are left alone and changed ones are replaced in place, keeping their
   pause. `croner stop <id>` lets a run in progress finish.
