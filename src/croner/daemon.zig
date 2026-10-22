@@ -1,5 +1,5 @@
-//! The daemon's jobs: one scheduler per job, pause and resume by id, and
-//! reload as a reconciliation by id.
+//! The daemon's jobs: one libcron scheduler, a table from config job id to
+//! scheduler job, and pause, resume and reload by id.
 
 const std = @import("std");
 const Io = std.Io;
@@ -15,97 +15,16 @@ const Status = protocol.Status;
 const state_paths = @import("state.zig");
 const logEvent = @import("log.zig").logEvent;
 
-const RuntimeJob = struct {
-    allocator: Allocator,
-    io: Io,
-    spec: JobSpec,
-    owned_environ: ?std.process.Environ.Map,
-    scheduler: libcron.Scheduler,
-    future: ?Io.Future(libcron.RunError!void) = null,
-    state: std.atomic.Value(Status),
-
-    fn create(allocator: Allocator, io: Io, parent_env: *const std.process.Environ.Map, spec: JobSpec) !*RuntimeJob {
-        var owned_spec = spec;
-        errdefer owned_spec.deinit();
-        const job = try allocator.create(RuntimeJob);
-        errdefer allocator.destroy(job);
-        job.* = undefined;
-        job.allocator = allocator;
-        job.io = io;
-        job.spec = owned_spec;
-        owned_spec.arena = null;
-        errdefer job.spec.deinit();
-        job.owned_environ = null;
-        errdefer if (job.owned_environ) |*environ| environ.deinit();
-        const environ_map = if (spec.env.len == 0)
-            parent_env
-        else blk: {
-            job.owned_environ = try parent_env.clone(allocator);
-            for (spec.env) |entry| try job.owned_environ.?.put(entry.key, entry.value);
-            break :blk &job.owned_environ.?;
-        };
-        job.scheduler = libcron.Scheduler.init(allocator);
-        errdefer job.scheduler.deinit();
-        _ = try job.scheduler.add(io, spec.expression, .{ .command = .{
-            .argv = spec.argv,
-            .cwd = .{ .path = spec.cwd },
-            .environ_map = environ_map,
-        } }, .{ .time_zone = .utc, .overlap = spec.overlap });
-        job.future = null;
-        job.state = .init(.paused);
-        return job;
-    }
-
-    fn start(self: *RuntimeJob) !void {
-        switch (self.state.load(.acquire)) {
-            .active => return,
-            .offline => if (self.future) |*future| {
-                _ = future.await(self.io) catch {};
-                self.future = null;
-            },
-            .paused => {},
-        }
-        self.state.store(.active, .release);
-        self.future = Io.concurrent(self.io, run, .{self}) catch |err| {
-            self.state.store(.offline, .release);
-            return err;
-        };
-    }
-
-    fn stop(self: *RuntimeJob) void {
-        if (self.future) |*future| {
-            _ = future.cancel(self.io) catch {};
-            self.future = null;
-        }
-        self.state.store(.paused, .release);
-    }
-
-    fn run(self: *RuntimeJob) libcron.RunError!void {
-        self.scheduler.run(self.io, .{ .context = self, .notify = observerNotify }) catch |err| {
-            if (err != error.Canceled) self.state.store(.offline, .release);
-            return err;
-        };
-        self.state.store(.offline, .release);
-    }
-
-    pub fn deinit(self: *RuntimeJob) void {
-        self.stop();
-        self.scheduler.deinit();
-        if (self.owned_environ) |*environ| environ.deinit();
-        self.spec.deinit();
-        self.allocator.destroy(self);
-    }
-};
-
-fn observerNotify(context: ?*anyopaque, _: libcron.Invocation, outcome: libcron.Outcome) void {
-    const job: *RuntimeJob = @ptrCast(@alignCast(context.?));
-    logEvent(job.io, "{s} {f}", .{ job.spec.id, outcome });
-}
-
 fn contains(ids: []const []const u8, id: []const u8) bool {
     for (ids) |candidate| if (std.mem.eql(u8, candidate, id)) return true;
     return false;
 }
+
+const Entry = struct {
+    spec: JobSpec,
+    job_id: libcron.JobId,
+    paused: bool,
+};
 
 pub const Daemon = struct {
     allocator: Allocator,
@@ -114,8 +33,19 @@ pub const Daemon = struct {
     config_path: []const u8,
     /// Ids of paused jobs, saved so pauses survive restarts. Borrowed.
     paused_path: []const u8,
-    jobs: std.ArrayList(*RuntimeJob),
+    scheduler: libcron.Scheduler,
+    entries: std.ArrayList(Entry),
+    /// The config id of every job ever added, so the outcome of a run that
+    /// outlives a reload still names its job. The observer reads it from job
+    /// tasks, hence the mutex.
+    // ponytail: grows by one id per job a reload adds; reloads are rare.
+    names: std.AutoHashMapUnmanaged(libcron.JobId, []const u8),
+    names_mutex: Io.Mutex,
+    run_future: ?Io.Future(libcron.RunError!void),
+    running: std.atomic.Value(bool),
 
+    /// Loads the config and adds its jobs, paused as `paused_path` records.
+    /// Call `start` once the daemon is at its final address.
     pub fn init(
         allocator: Allocator,
         io: Io,
@@ -131,7 +61,12 @@ pub const Daemon = struct {
             .parent_env = parent_env,
             .config_path = config_absolute,
             .paused_path = paused_path,
-            .jobs = .empty,
+            .scheduler = .init(allocator),
+            .entries = .empty,
+            .names = .empty,
+            .names_mutex = .init,
+            .run_future = null,
+            .running = .init(false),
         };
         errdefer result.deinit();
         var specs = try config.loadConfig(allocator, io, result.config_path, problem);
@@ -145,197 +80,243 @@ pub const Daemon = struct {
         };
         defer if (paused) |*ids| ids.deinit();
         const paused_ids: []const []const u8 = if (paused) |ids| ids.value else &.{};
-        try result.jobs.ensureTotalCapacity(allocator, specs.items.items.len);
+        try result.entries.ensureTotalCapacity(allocator, specs.items.items.len);
         for (specs.items.items) |*spec| {
-            const runtime = try RuntimeJob.create(allocator, io, parent_env, spec.move());
-            result.jobs.appendAssumeCapacity(runtime);
-            if (!contains(paused_ids, runtime.spec.id)) try runtime.start();
+            const job_id = try result.addJob(spec);
+            const is_paused = contains(paused_ids, spec.id);
+            if (is_paused) _ = result.scheduler.pause(io, job_id);
+            result.entries.appendAssumeCapacity(.{ .spec = spec.move(), .job_id = job_id, .paused = is_paused });
         }
         return result;
+    }
+
+    pub fn deinit(self: *Daemon) void {
+        self.shutdown();
+        self.scheduler.deinit();
+        for (self.entries.items) |*entry| entry.spec.deinit();
+        self.entries.deinit(self.allocator);
+        var names = self.names.valueIterator();
+        while (names.next()) |name| self.allocator.free(name.*);
+        self.names.deinit(self.allocator);
+        self.allocator.free(self.config_path);
+        self.* = undefined;
+    }
+
+    pub fn start(self: *Daemon) !void {
+        self.running.store(true, .release);
+        self.run_future = Io.concurrent(self.io, run, .{self}) catch |err| {
+            self.running.store(false, .release);
+            return err;
+        };
+    }
+
+    /// Stops the scheduler. Running commands get SIGTERM, then SIGKILL once
+    /// their grace period ends.
+    pub fn shutdown(self: *Daemon) void {
+        if (self.run_future) |*future| {
+            _ = future.cancel(self.io) catch {};
+            self.run_future = null;
+        }
+    }
+
+    fn run(self: *Daemon) libcron.RunError!void {
+        defer self.running.store(false, .release);
+        return self.scheduler.run(self.io, .init(self, notify));
+    }
+
+    fn notify(self: *Daemon, invocation: libcron.Invocation, outcome: libcron.Outcome) void {
+        self.names_mutex.lockUncancelable(self.io);
+        defer self.names_mutex.unlock(self.io);
+        logEvent(self.io, "{s} {f}", .{ self.names.get(invocation.job_id) orelse "?", outcome });
+    }
+
+    fn addJob(self: *Daemon, spec: *const JobSpec) !libcron.JobId {
+        const name = try self.allocator.dupe(u8, spec.id);
+        errdefer self.allocator.free(name);
+        {
+            self.names_mutex.lockUncancelable(self.io);
+            defer self.names_mutex.unlock(self.io);
+            try self.names.ensureUnusedCapacity(self.allocator, 1);
+        }
+        var environ: ?std.process.Environ.Map = null;
+        defer if (environ) |*map| map.deinit();
+        if (spec.env.len > 0) {
+            environ = try self.parent_env.clone(self.allocator);
+            for (spec.env) |entry| try environ.?.put(entry.key, entry.value);
+        }
+        const job_id = try self.scheduler.add(self.io, spec.expression, .{ .command = .{
+            .argv = spec.argv,
+            .cwd = .{ .path = spec.cwd },
+            .environ_map = if (environ) |*map| map else self.parent_env,
+        } }, .{ .overlap = spec.overlap });
+        self.names_mutex.lockUncancelable(self.io);
+        defer self.names_mutex.unlock(self.io);
+        self.names.putAssumeCapacity(job_id, name);
+        return job_id;
+    }
+
+    fn indexOf(self: *const Daemon, id: []const u8) ?usize {
+        for (self.entries.items, 0..) |entry, index| if (std.mem.eql(u8, entry.spec.id, id)) return index;
+        return null;
     }
 
     fn savePaused(self: *Daemon) !void {
         var ids: std.ArrayList([]const u8) = .empty;
         defer ids.deinit(self.allocator);
-        for (self.jobs.items) |job| {
-            if (job.state.load(.acquire) == .paused) try ids.append(self.allocator, job.spec.id);
+        for (self.entries.items) |entry| {
+            if (entry.paused) try ids.append(self.allocator, entry.spec.id);
         }
         try state_paths.savePaused(self.allocator, self.io, self.paused_path, ids.items);
     }
 
-    pub fn deinit(self: *Daemon) void {
-        for (self.jobs.items) |job| job.deinit();
-        self.jobs.deinit(self.allocator);
-        self.allocator.free(self.config_path);
-        self.* = undefined;
-    }
-
-    pub fn find(self: *Daemon, id: []const u8) ?*RuntimeJob {
-        for (self.jobs.items) |job| if (std.mem.eql(u8, job.spec.id, id)) return job;
-        return null;
-    }
-
     pub fn setRunning(self: *Daemon, id: []const u8, running: bool) !void {
-        const job = self.find(id) orelse return error.UnknownJob;
-        if (running) try job.start() else job.stop();
+        const entry = &self.entries.items[self.indexOf(id) orelse return error.UnknownJob];
+        if (entry.paused == !running) return;
+        _ = if (running) self.scheduler.unpause(self.io, entry.job_id) else self.scheduler.pause(self.io, entry.job_id);
+        entry.paused = !running;
         try self.savePaused();
     }
 
-    pub fn stopAll(self: *Daemon) void {
-        for (self.jobs.items) |job| job.stop();
-    }
-
+    /// Applies the config by job id: an unchanged job keeps its scheduler
+    /// job, a changed one is replaced and keeps its pause, a removed one is
+    /// removed, and a new one starts active. Replacements are added before
+    /// anything is removed, so a failed reload leaves the daemon as it was.
     pub fn reload(self: *Daemon, problem: *Io.Writer) !void {
         var specs = try config.loadConfig(self.allocator, self.io, self.config_path, problem);
-        errdefer specs.deinit();
-        const Existing = struct {
-            job: *RuntimeJob,
-            retained: bool = false,
-            was_active: bool = false,
-            was_paused: bool = false,
+        defer specs.deinit();
+        const new_specs = specs.items.items;
+        const Change = union(enum) {
+            keep: usize,
+            add: struct { job_id: libcron.JobId, paused: bool },
         };
-        var existing_by_id = std.StringHashMap(Existing).init(self.allocator);
-        defer existing_by_id.deinit();
-        try existing_by_id.ensureTotalCapacity(@intCast(self.jobs.items.len));
-        for (self.jobs.items) |job| existing_by_id.putAssumeCapacity(job.spec.id, .{ .job = job });
-        var next: std.ArrayList(*RuntimeJob) = .empty;
-        var created: std.ArrayList(*RuntimeJob) = .empty;
-        errdefer {
-            for (created.items) |job| job.deinit();
-            created.deinit(self.allocator);
-            next.deinit(self.allocator);
-        }
-        try next.ensureTotalCapacity(self.allocator, specs.items.items.len);
-        try created.ensureTotalCapacity(self.allocator, specs.items.items.len);
-        for (specs.items.items) |*candidate| {
-            if (existing_by_id.getPtr(candidate.id)) |existing| {
-                if (existing.job.spec.eql(candidate)) {
-                    existing.retained = true;
-                    next.appendAssumeCapacity(existing.job);
+        const changes = try self.allocator.alloc(Change, new_specs.len);
+        defer self.allocator.free(changes);
+        const kept = try self.allocator.alloc(bool, self.entries.items.len);
+        defer self.allocator.free(kept);
+        @memset(kept, false);
+        var next: std.ArrayList(Entry) = try .initCapacity(self.allocator, new_specs.len);
+        errdefer next.deinit(self.allocator);
+
+        var planned: usize = 0;
+        errdefer for (changes[0..planned]) |change| switch (change) {
+            .keep => {},
+            .add => |added| _ = self.scheduler.remove(self.io, added.job_id),
+        };
+        for (new_specs, changes) |*spec, *change| {
+            const old_index = self.indexOf(spec.id);
+            if (old_index) |index| {
+                if (self.entries.items[index].spec.eql(spec)) {
+                    change.* = .{ .keep = index };
+                    kept[index] = true;
+                    planned += 1;
                     continue;
                 }
             }
-            const runtime = try RuntimeJob.create(self.allocator, self.io, self.parent_env, candidate.move());
-            created.appendAssumeCapacity(runtime);
-            next.appendAssumeCapacity(runtime);
+            const paused = if (old_index) |index| self.entries.items[index].paused else false;
+            const job_id = try self.addJob(spec);
+            // ponytail: dispatch could slip in before this pause at a minute boundary; JobOptions has no paused flag.
+            if (paused) _ = self.scheduler.pause(self.io, job_id);
+            change.* = .{ .add = .{ .job_id = job_id, .paused = paused } };
+            planned += 1;
         }
-        var existing_iterator = existing_by_id.valueIterator();
-        while (existing_iterator.next()) |existing| {
-            existing.was_paused = existing.job.state.load(.acquire) == .paused;
-            existing.was_active = !existing.retained and existing.job.state.load(.acquire) == .active;
-            if (existing.was_active) existing.job.stop();
+
+        for (new_specs, changes) |*spec, change| next.appendAssumeCapacity(switch (change) {
+            .keep => |index| self.entries.items[index],
+            .add => |added| .{ .spec = spec.move(), .job_id = added.job_id, .paused = added.paused },
+        });
+        for (self.entries.items, kept) |*entry, keep| {
+            if (keep) continue;
+            _ = self.scheduler.remove(self.io, entry.job_id);
+            entry.spec.deinit();
         }
-        for (created.items) |job| {
-            // A paused job stays paused when its definition changes.
-            if (existing_by_id.get(job.spec.id)) |existing| if (existing.was_paused) continue;
-            job.start() catch |err| {
-                for (created.items) |created_job| created_job.stop();
-                var restore_iterator = existing_by_id.valueIterator();
-                while (restore_iterator.next()) |existing| {
-                    if (existing.was_active) existing.job.start() catch |restart_err|
-                        logEvent(self.io, "{s} failed to resume after reload: {t}", .{ existing.job.spec.id, restart_err });
-                }
-                return err;
-            };
-        }
-        var cleanup_iterator = existing_by_id.valueIterator();
-        while (cleanup_iterator.next()) |existing| {
-            if (!existing.retained) existing.job.deinit();
-        }
-        self.jobs.deinit(self.allocator);
-        self.jobs = next;
-        created.deinit(self.allocator);
-        specs.deinit();
+        self.entries.deinit(self.allocator);
+        self.entries = next;
         self.savePaused() catch |err| logEvent(self.io, "could not save paused jobs: {t}", .{err});
     }
 
     pub fn status(self: *const Daemon, allocator: Allocator) ![]JobStatus {
-        const result = try allocator.alloc(JobStatus, self.jobs.items.len);
-        for (self.jobs.items, 0..) |job, i| result[i] = .{
-            .id = job.spec.id,
-            .schedule = job.spec.schedule,
-            .status = job.state.load(.acquire),
+        const running = self.running.load(.acquire);
+        const result = try allocator.alloc(JobStatus, self.entries.items.len);
+        for (self.entries.items, result) |entry, *item| item.* = .{
+            .id = entry.spec.id,
+            .schedule = entry.spec.schedule,
+            .status = if (!running) .offline else if (entry.paused) .paused else .active,
         };
         return result;
     }
 };
 
-test "daemon pause and reload reconcile by stable job id" {
+fn expectStatus(daemon: *const Daemon, id: []const u8, expected: Status) !void {
+    const statuses = try daemon.status(std.testing.allocator);
+    defer std.testing.allocator.free(statuses);
+    for (statuses) |item| if (std.mem.eql(u8, item.id, id)) return std.testing.expectEqual(expected, item.status);
+    return error.TestUnexpectedResult;
+}
+
+test "one scheduler pauses, resumes and reloads jobs by id" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const io = std.testing.io;
     const initial = "{\"jobs\":[{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"change\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"remove\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}}]}";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "croner.json", .data = initial });
-    const path = try tmp.dir.realPathFileAlloc(std.testing.io, "croner.json", std.testing.allocator);
+    try tmp.dir.writeFile(io, .{ .sub_path = "croner.json", .data = initial });
+    const path = try tmp.dir.realPathFileAlloc(io, "croner.json", std.testing.allocator);
     defer std.testing.allocator.free(path);
+    const paused_path = try std.fs.path.join(std.testing.allocator, &.{ std.fs.path.dirname(path).?, "paused.json" });
+    defer std.testing.allocator.free(paused_path);
     var environ: std.process.Environ.Map = .init(std.testing.allocator);
     defer environ.deinit();
     var problem_buffer: [512]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    const dir = std.fs.path.dirname(path).?;
-    const paused_path = try std.fs.path.join(std.testing.allocator, &.{ dir, "paused.json" });
-    defer std.testing.allocator.free(paused_path);
-    var daemon = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path, paused_path, &problem);
+    var daemon = try Daemon.init(std.testing.allocator, io, &environ, path, paused_path, &problem);
     defer daemon.deinit();
+    try daemon.start();
 
-    const keep = daemon.find("keep").?;
-    const change = daemon.find("change").?;
-    try std.testing.expect(keep.owned_environ == null);
+    try expectStatus(&daemon, "keep", .active);
     try daemon.setRunning("keep", false);
-    try std.testing.expect(keep.future == null);
+    try expectStatus(&daemon, "keep", .paused);
     try daemon.setRunning("keep", true);
-    try std.testing.expect(keep.future != null);
+    try expectStatus(&daemon, "keep", .active);
     try daemon.setRunning("keep", false);
     try daemon.setRunning("change", false);
     try daemon.setRunning("remove", false);
+    try std.testing.expectError(error.UnknownJob, daemon.setRunning("nope", false));
+    const keep_id = daemon.entries.items[daemon.indexOf("keep").?].job_id;
+    const change_id = daemon.entries.items[daemon.indexOf("change").?].job_id;
+    const remove_id = daemon.entries.items[daemon.indexOf("remove").?].job_id;
 
     const invalid = "{\"jobs\":[{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}}]}";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "croner.json", .data = invalid });
+    try tmp.dir.writeFile(io, .{ .sub_path = "croner.json", .data = invalid });
     try std.testing.expectError(error.InvalidConfig, daemon.reload(&problem));
-    try std.testing.expect(daemon.find("keep").? == keep);
-    try std.testing.expect(daemon.find("change").? == change);
-    try std.testing.expect(keep.future == null);
+    try std.testing.expectEqual(@as(usize, 3), daemon.entries.items.len);
+    try std.testing.expectEqual(change_id, daemon.entries.items[daemon.indexOf("change").?].job_id);
 
     const updated = "{\"jobs\":[{\"id\":\"keep\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"change\",\"schedule\":\"*/2 * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"]}}},{\"id\":\"new\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"/usr/bin/true\"],\"env\":{\"CRONER_TEST\":\"1\"}}}}]}";
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "croner.json", .data = updated });
+    try tmp.dir.writeFile(io, .{ .sub_path = "croner.json", .data = updated });
     try daemon.reload(&problem);
-    try std.testing.expect(daemon.find("keep").? == keep);
-    try std.testing.expect(keep.future == null);
-    try std.testing.expect(daemon.find("change").? != change);
-    try std.testing.expect(daemon.find("change").?.future == null);
-    try std.testing.expect(daemon.find("remove") == null);
-    var saved = try state_paths.loadPaused(std.testing.allocator, std.testing.io, paused_path);
+    try std.testing.expectEqual(keep_id, daemon.entries.items[daemon.indexOf("keep").?].job_id);
+    try expectStatus(&daemon, "keep", .paused);
+    const new_change_id = daemon.entries.items[daemon.indexOf("change").?].job_id;
+    try std.testing.expect(new_change_id != change_id);
+    try expectStatus(&daemon, "change", .paused);
+    try std.testing.expect(daemon.indexOf("remove") == null);
+    try expectStatus(&daemon, "new", .active);
+    // Replaced and removed jobs are gone from the scheduler.
+    try std.testing.expect(!daemon.scheduler.remove(io, change_id));
+    try std.testing.expect(!daemon.scheduler.remove(io, remove_id));
+    var saved = try state_paths.loadPaused(std.testing.allocator, io, paused_path);
     defer saved.deinit();
     try std.testing.expectEqual(@as(usize, 2), saved.value.len);
     try std.testing.expectEqualStrings("keep", saved.value[0]);
     try std.testing.expectEqualStrings("change", saved.value[1]);
-    const new_job = daemon.find("new").?;
-    try std.testing.expect(new_job.future != null);
-    try std.testing.expectEqualStrings("1", new_job.owned_environ.?.get("CRONER_TEST").?);
 
-    const failed = new_job;
-    failed.stop();
-    failed.scheduler.running = true;
-    try failed.start();
-    try std.testing.expectError(error.AlreadyRunning, failed.future.?.await(std.testing.io));
-    try std.testing.expectEqual(Status.offline, failed.state.load(.acquire));
-    const statuses = try daemon.status(std.testing.allocator);
-    defer std.testing.allocator.free(statuses);
-    try std.testing.expectEqualStrings("new", statuses[2].id);
-    try std.testing.expectEqual(Status.offline, statuses[2].status);
-
-    failed.scheduler.running = false;
-    try failed.start();
-    try std.testing.expectEqual(Status.active, failed.state.load(.acquire));
-    daemon.stopAll();
-    for (daemon.jobs.items) |job| {
-        try std.testing.expect(job.future == null);
-        try std.testing.expectEqual(Status.paused, job.state.load(.acquire));
-    }
+    daemon.shutdown();
+    try expectStatus(&daemon, "new", .offline);
 
     // Shutting down pauses nothing on disk; a restart resumes what the user did not pause.
-    var restarted = try Daemon.init(std.testing.allocator, std.testing.io, &environ, path, paused_path, &problem);
+    var restarted = try Daemon.init(std.testing.allocator, io, &environ, path, paused_path, &problem);
     defer restarted.deinit();
-    try std.testing.expectEqual(Status.paused, restarted.find("keep").?.state.load(.acquire));
-    try std.testing.expectEqual(Status.paused, restarted.find("change").?.state.load(.acquire));
-    try std.testing.expectEqual(Status.active, restarted.find("new").?.state.load(.acquire));
+    try restarted.start();
+    try expectStatus(&restarted, "keep", .paused);
+    try expectStatus(&restarted, "change", .paused);
+    try expectStatus(&restarted, "new", .active);
 }

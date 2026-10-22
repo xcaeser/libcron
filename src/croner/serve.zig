@@ -64,6 +64,7 @@ pub fn serve(init: std.process.Init, config_path: []const u8) !void {
         return err;
     };
     defer daemon.deinit();
+    try daemon.start();
     var server = try protocol.listenState(init.io, &state);
     defer {
         server.deinit(init.io);
@@ -128,7 +129,7 @@ fn handleRequest(daemon: *Daemon, stream: *Io.net.Stream, request_bytes: []const
             const running = parsed.value == .start;
             daemon.setRunning(id, running) catch |err| return switch (err) {
                 error.UnknownJob => sendError(daemon, stream, "no job \"{s}\" in {s}", .{ id, daemon.config_path }),
-                else => sendError(daemon, stream, "could not resume \"{s}\": {t}", .{ id, err }),
+                else => sendError(daemon, stream, "could not {s} \"{s}\": {t}", .{ if (running) "resume" else "pause", id, err }),
             };
             try sendMessage(stream, daemon.io, Response, .{ .ok = if (running) "started" else "stopped" }, daemon.allocator);
         },
@@ -142,7 +143,7 @@ fn handleRequest(daemon: *Daemon, stream: *Io.net.Stream, request_bytes: []const
             try sendMessage(stream, daemon.io, Response, .{ .ok = "reloaded" }, daemon.allocator);
         },
         .shutdown => {
-            daemon.stopAll();
+            daemon.shutdown();
             shutdown.* = true;
             try sendMessage(stream, daemon.io, Response, .{ .ok = "stopped" }, daemon.allocator);
         },

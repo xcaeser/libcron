@@ -123,7 +123,7 @@ To build from source, run `zig build`; the executable is written to
 | `croner setup`      | Interactively create a config; refuses to overwrite one. |
 | `croner start`      | Validate the config and start its background daemon.     |
 | `croner start <id>` | Resume a paused job.                                     |
-| `croner stop <id>`  | Pause future runs and cancel active invocations.         |
+| `croner stop <id>`  | Pause future runs; a run in progress finishes.           |
 | `croner stop`       | Shut down the daemon and all jobs.                       |
 | `croner list`       | Show jobs as `active`, `paused`, or `offline`.           |
 | `croner reload`     | Validate and reconcile the config by stable job ID.      |
@@ -138,10 +138,12 @@ the config's absolute path, so `--config` reaches the same daemon from any
 directory and the project directory stays clean.
 
 `logs` accepts `--lines <n>` and `--follow`. A reload leaves the daemon
-untouched when validation fails. Unchanged jobs keep their runner; changed,
-removed, and new jobs are reconciled by ID. Pauses follow the job ID and are
-saved in the state directory, so paused jobs stay paused across reloads,
-daemon restarts, crashes, and reboots.
+untouched when validation fails. Otherwise it compares jobs by ID: an
+unchanged job keeps its schedule state, a changed job is replaced, a removed
+job is no longer scheduled (a run in progress finishes), and a new job starts
+active. A pause belongs to the ID, so a changed job that was paused stays
+paused. Paused IDs are saved in the state directory, so they stay paused
+across daemon restarts, crashes, and reboots.
 
 ### Run at login
 
