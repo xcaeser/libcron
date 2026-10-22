@@ -34,6 +34,7 @@ fn installSignalHandlers() void {
 }
 
 pub fn serve(init: std.process.Init, config_path: []const u8) !void {
+    try reserveStdio();
     switch (std.posix.errno(std.posix.system.setsid())) {
         .SUCCESS => {},
         // Only a process group leader gets EPERM; launchd and systemd start services that way.
@@ -83,6 +84,17 @@ pub fn serve(init: std.process.Init, config_path: []const u8) !void {
     switch (event) {
         .server => |result| result catch |err| if (err != error.Canceled) return err,
         .signal => {},
+    }
+}
+
+/// Opens /dev/null on any of fds 0-2 the launcher left closed. Otherwise the
+/// lock file or the signal pipe could take one, and the log redirect would
+/// replace it, releasing the lock or ending the daemon.
+fn reserveStdio() !void {
+    for (0..3) |fd| {
+        if (std.posix.errno(std.posix.system.fcntl(@intCast(fd), std.posix.F.GETFD, @as(usize, 0))) != .BADF) continue;
+        // open returns the lowest free descriptor, which is this one.
+        _ = try std.posix.openat(std.posix.AT.FDCWD, "/dev/null", .{ .ACCMODE = .RDWR }, 0);
     }
 }
 
