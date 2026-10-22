@@ -44,7 +44,6 @@ pub const DateTime = struct {
 };
 
 pub const seconds_per_day = 86_400;
-pub const days_per_gregorian_cycle = 146_097;
 
 /// Minutes from 1970-01-01 00:00 to `date_time` on the same calendar,
 /// ignoring any UTC offset.

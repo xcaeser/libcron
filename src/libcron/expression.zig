@@ -67,32 +67,37 @@ pub const Expression = struct {
     /// before the maximum representable year.
     pub fn next(self: Expression, after: DateTime) DateTimeError!?DateTime {
         try after.validate();
-        var date_time = calendar.nextMinute(after) orelse return null;
-
-        var days_checked: u32 = 0;
-        while (days_checked < calendar.days_per_gregorian_cycle) : (days_checked += 1) {
-            const first_day = days_checked == 0;
-            if (has(self.months, date_time.month.numeric(), 1) and self.dayMatches(date_time)) {
-                var hour: u8 = if (first_day) date_time.hour else 0;
-                while (hour < 24) : (hour += 1) {
-                    if (!has(self.hours, hour, 0)) continue;
-
-                    var minute: u8 = if (first_day and hour == date_time.hour) date_time.minute else 0;
-                    while (minute < 60) : (minute += 1) {
-                        if (has(self.minutes, minute, 0)) {
-                            return .{
-                                .year = date_time.year,
-                                .month = date_time.month,
-                                .day = date_time.day,
-                                .hour = hour,
-                                .minute = minute,
-                            };
-                        }
-                    }
+        const start = calendar.nextMinute(after) orelse return null;
+        var year = start.year;
+        var month: u4 = start.month.numeric();
+        for (0..12 * 400 + 1) |_| {
+            const in_start_month = year == start.year and month == start.month.numeric();
+            if (has(self.months, month, 1)) {
+                var days = self.matchingDays(year, month);
+                if (in_start_month) days &= ~@as(u32, 0) << @intCast(start.day - 1);
+                while (days != 0) : (days &= days - 1) {
+                    const day: u8 = @ctz(days) + 1;
+                    const from_start = in_start_month and day == start.day;
+                    const time = self.firstTime(
+                        if (from_start) start.hour else 0,
+                        if (from_start) start.minute else 0,
+                    ) orelse continue;
+                    return .{
+                        .year = year,
+                        .month = @fromBackingInt(month),
+                        .day = day,
+                        .hour = time.hour,
+                        .minute = time.minute,
+                    };
                 }
             }
-
-            date_time = calendar.nextDay(date_time) orelse return null;
+            if (month < 12) {
+                month += 1;
+            } else {
+                if (year == std.math.maxInt(u16)) return null;
+                year += 1;
+                month = 1;
+            }
         }
         return null;
     }
@@ -104,6 +109,34 @@ pub const Expression = struct {
     /// or hour is `*`. `null` when that instant is past the year 65535.
     pub fn nextInstant(self: Expression, after_unix_seconds: i64, zone: time_zone.TimeZone) ?i64 {
         return wall_clock.nextInstant(self, after_unix_seconds, zone) catch null;
+    }
+
+    /// Bit `d - 1` is set when day `d` of the month matches the day fields.
+    fn matchingDays(self: Expression, year: u16, month: u4) u32 {
+        const length = std.time.epoch.getDaysInMonth(year, @fromBackingInt(month));
+        const in_month = (@as(u32, 1) << length) - 1;
+        // Rotate the weekdays so bit 0 is the 1st's weekday, then repeat weekly.
+        const first = calendar.weekday(.{ .year = year, .month = @fromBackingInt(month), .day = 1, .hour = 0, .minute = 0 });
+        const weekdays: u64 = self.days_of_week;
+        const week = ((weekdays >> @intCast(first)) | (weekdays << @intCast(7 - first))) & 0x7f;
+        const by_weekday: u32 = @truncate(week * 0x1020_4081);
+        const by_month_day = self.days_of_month & in_month;
+        return if (self.day_of_month_star or self.day_of_week_star)
+            by_month_day & by_weekday
+        else
+            (by_month_day | by_weekday) & in_month;
+    }
+
+    /// The first matching hour and minute at or after `hour:minute`.
+    fn firstTime(self: Expression, hour: u8, minute: u8) ?struct { hour: u8, minute: u8 } {
+        if (has(self.hours, hour, 0)) {
+            const minutes = self.minutes & (~@as(u64, 0) << @intCast(minute));
+            if (minutes != 0) return .{ .hour = hour, .minute = @ctz(minutes) };
+        }
+        if (hour == 23 or self.minutes == 0) return null;
+        const hours = self.hours & (~@as(u32, 0) << @intCast(hour + 1));
+        if (hours == 0) return null;
+        return .{ .hour = @ctz(hours), .minute = @ctz(self.minutes) };
     }
 
     fn dayMatches(self: Expression, date_time: DateTime) bool {
