@@ -179,7 +179,7 @@ pub const Scheduler = struct {
         // Only instants outside the years 1 through 65535 fail to convert.
         const unix_seconds = std.math.mul(i64, unix_minute, 60) catch return;
         var cursor: u64 = 0;
-        while (self.nextDue(io, &cursor, unix_minute, unix_seconds)) |due| switch (due) {
+        while (self.nextDue(io, &cursor, unix_seconds)) |due| switch (due) {
             .skipped => |invocation| report(observer, invocation, .skipped_overlap),
             .claimed => |claimed| group.concurrent(
                 io,
@@ -200,7 +200,7 @@ pub const Scheduler = struct {
     /// Finds the first job with an id at or after `cursor` that is due, and
     /// moves `cursor` past it. The lock is held only during the search, so
     /// the caller can start the job and notify the observer unlocked.
-    fn nextDue(self: *Scheduler, io: std.Io, cursor: *u64, unix_minute: i64, unix_seconds: i64) ?Due {
+    fn nextDue(self: *Scheduler, io: std.Io, cursor: *u64, unix_seconds: i64) ?Due {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
         const start = std.sort.partitionPoint(*Job, self.jobs.items, cursor.*, idBefore);
@@ -211,7 +211,7 @@ pub const Scheduler = struct {
             if (!job.wall.due(job.expression, local_time)) continue;
             const invocation: Invocation = .{
                 .job_id = job.id,
-                .scheduled_unix_minute = unix_minute,
+                .scheduled_unix_seconds = unix_seconds,
                 .local_time = local_time,
             };
             if (!job.claim()) return .{ .skipped = invocation };
@@ -281,14 +281,14 @@ const TestOutcomes = struct {
     skipped_overlap: std.atomic.Value(u32) = .init(0),
     command_exit: std.atomic.Value(i32) = .init(-1),
     dispatch_error: std.atomic.Value(u32) = .init(0),
-    last_success_minute: std.atomic.Value(i64) = .init(0),
+    last_success_seconds: std.atomic.Value(i64) = .init(0),
 
     fn notify(context: ?*anyopaque, invocation: Invocation, outcome: Outcome) void {
         const self: *TestOutcomes = @ptrCast(@alignCast(context.?));
         switch (outcome) {
             .callback_success => {
                 _ = self.callback_success.fetchAdd(1, .monotonic);
-                self.last_success_minute.store(invocation.scheduled_unix_minute, .monotonic);
+                self.last_success_seconds.store(invocation.scheduled_unix_seconds, .monotonic);
             },
             .callback_error => _ = self.callback_error.fetchAdd(1, .monotonic),
             .skipped_overlap => _ = self.skipped_overlap.fetchAdd(1, .monotonic),
@@ -440,7 +440,7 @@ test "fixed-time jobs run once and wildcard jobs every real quarter hour across 
             defer daily.deinit();
             try daily.dispatchRange(first, end);
             try std.testing.expectEqual(1, daily.fired());
-            try std.testing.expectEqual(transition.expected, daily.outcomes.last_success_minute.load(.monotonic));
+            try std.testing.expectEqual(transition.expected * 60, daily.outcomes.last_success_seconds.load(.monotonic));
 
             var quarter_hourly = try TestClock.init("*/15 * * * *", zone);
             defer quarter_hourly.deinit();

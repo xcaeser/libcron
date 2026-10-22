@@ -18,7 +18,9 @@ pub const OverlapPolicy = enum {
 
 pub const Invocation = struct {
     job_id: JobId,
-    scheduled_unix_minute: i64,
+    /// The start of the minute the job was dispatched for, in seconds since
+    /// the Unix epoch.
+    scheduled_unix_seconds: i64,
     local_time: DateTime,
 };
 
@@ -210,7 +212,7 @@ test "typed callbacks and observers receive their own context" {
     const observer: Observer = .init(&counter, Counter.record);
     const invocation: Invocation = .{
         .job_id = @fromBackingInt(1),
-        .scheduled_unix_minute = 0,
+        .scheduled_unix_seconds = 0,
         .local_time = try DateTime.init(2026, .jan, 1, 0, 0),
     };
     try std.testing.expectError(error.Failed, callback.run(callback.context, std.testing.io, invocation));
