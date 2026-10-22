@@ -493,31 +493,8 @@ fn startBackground(ctx: zli.CommandContext) !void {
     specs.deinit();
     var state = try openState(ctx, absolute);
     defer state.deinit();
-    try state.ensure(app.io);
     if (try daemonSocketAvailable(app.io, &state)) return fail(ctx, "croner is already running for {s}", .{config_path});
 
-    var log = Io.Dir.cwd().createFile(app.io, state.log, .{
-        .read = true,
-        .truncate = false,
-        .permissions = .fromMode(0o600),
-    }) catch |err| switch (err) {
-        error.FileNotFound => blk: {
-            const parent = std.fs.path.dirname(state.log) orelse return err;
-            _ = try Io.Dir.cwd().createDirPathStatus(app.io, parent, .fromMode(0o700));
-            break :blk try Io.Dir.cwd().createFile(app.io, state.log, .{
-                .read = true,
-                .truncate = false,
-                .permissions = .fromMode(0o600),
-            });
-        },
-        else => return err,
-    };
-    defer log.close(app.io);
-    try log.setPermissions(app.io, .fromMode(0o600));
-    const log_size = (try log.stat(app.io)).size;
-    var log_buffer: [1]u8 = undefined;
-    var log_writer = Io.File.Writer.initStreaming(log, app.io, &log_buffer);
-    try log_writer.seekTo(log_size);
     const executable = try std.process.executablePathAlloc(app.io, app.allocator);
     defer app.allocator.free(executable);
     const argv = [_][]const u8{ executable, "_serve", absolute };
@@ -525,8 +502,9 @@ fn startBackground(ctx: zli.CommandContext) !void {
         .argv = &argv,
         .cwd = .{ .path = dir },
         .stdin = .ignore,
-        .stdout = .{ .file = log },
-        .stderr = .{ .file = log },
+        .stdout = .ignore,
+        // Failures before the daemon opens its log reach the user.
+        .stderr = .inherit,
     });
     var started = false;
     var child_owned = true;
@@ -701,7 +679,12 @@ fn commandVersion(ctx: zli.CommandContext) !void {
 }
 
 fn serve(init: std.process.Init, config_path: []const u8) !void {
-    if (std.posix.errno(std.posix.system.setsid()) != .SUCCESS) return error.DetachFailed;
+    switch (std.posix.errno(std.posix.system.setsid())) {
+        .SUCCESS => {},
+        // Only a process group leader gets EPERM; launchd and systemd start services that way.
+        .PERM => {},
+        else => return error.DetachFailed,
+    }
     const fds = try Io.Threaded.pipe2(.{ .CLOEXEC = true });
     const signal_reader = Io.File{ .handle = fds[0], .flags = .{ .nonblocking = false } };
     const signal_writer = Io.File{ .handle = fds[1], .flags = .{ .nonblocking = false } };
@@ -718,6 +701,7 @@ fn serve(init: std.process.Init, config_path: []const u8) !void {
         else => return err,
     };
     defer state_lock.close(init.io);
+    try redirectToLog(init.io, state.log);
     var problem_buffer: [1024]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
     var daemon = Daemon.init(init.gpa, init.io, init.environ_map, config_path, &problem) catch |err| {
@@ -746,6 +730,20 @@ fn serve(init: std.process.Init, config_path: []const u8) !void {
         .signal => {},
     }
     logEvent(init.io, "daemon stopped", .{});
+}
+
+/// Points stdout and stderr, which jobs inherit, at the log, whoever launched the daemon.
+fn redirectToLog(io: Io, path: []const u8) !void {
+    const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .APPEND = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    defer (Io.File{ .handle = fd, .flags = .{ .nonblocking = false } }).close(io);
+    for ([_]std.posix.fd_t{ std.posix.STDOUT_FILENO, std.posix.STDERR_FILENO }) |target| {
+        if (std.posix.errno(std.posix.system.dup2(fd, target)) != .SUCCESS) return error.LogRedirectFailed;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
