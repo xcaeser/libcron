@@ -11,20 +11,23 @@ pub const TimeZoneError = error{
     InvalidOffset,
     InvalidTzif,
     InvalidTzifFooter,
-    MissingFutureRule,
     DateOutOfRange,
 };
+
+const default_zoneinfo = "/usr/share/zoneinfo";
 
 const min_utc_offset = -89_999;
 const max_utc_offset = 93_599;
 
-/// A validated UTC, fixed-offset, or caller-owned TZif timezone.
+/// A validated UTC, fixed-offset, or TZif timezone.
 pub const TimeZone = struct {
     value: union(enum) {
         fixed: i32,
         tzif: struct {
             tz: *const std.Tz,
             footer: ?PosixTimeZone,
+            /// Whether `tz` came from `load` and is freed by `deinit`.
+            owned: bool = false,
         },
     },
 
@@ -37,47 +40,68 @@ pub const TimeZone = struct {
         return .{ .value = .{ .fixed = seconds } };
     }
 
+    /// Loads `name`, such as `Europe/Paris`, from the TZif database in
+    /// `$TZDIR` when `environ_map` sets it, else in `/usr/share/zoneinfo`. The
+    /// zone must outlive every job using it; free it with `deinit`.
+    pub fn load(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        environ_map: ?*const std.process.Environ.Map,
+        name: []const u8,
+    ) !TimeZone {
+        if (name.len == 0 or name[0] == '/' or std.mem.indexOf(u8, name, "..") != null)
+            return error.InvalidTimeZoneName;
+        const directory = if (environ_map) |map| map.get("TZDIR") orelse default_zoneinfo else default_zoneinfo;
+        const path = try std.fs.path.join(allocator, &.{ directory, name });
+        defer allocator.free(path);
+        // TZif files are a few KiB; the limit only stops a wrong path early.
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20));
+        defer allocator.free(bytes);
+
+        const tz = try allocator.create(std.Tz);
+        errdefer allocator.destroy(tz);
+        var reader: std.Io.Reader = .fixed(bytes);
+        tz.* = try std.Tz.parse(allocator, &reader);
+        errdefer tz.deinit();
+        var zone = try fromTz(tz);
+        zone.value.tzif.owned = true;
+        return zone;
+    }
+
+    /// Frees a zone returned by `load`; other zones need no cleanup.
+    pub fn deinit(self: *TimeZone) void {
+        switch (self.value) {
+            .fixed => {},
+            .tzif => |zone| if (zone.owned) {
+                const tz: *std.Tz = @constCast(zone.tz);
+                const allocator = tz.allocator;
+                tz.deinit();
+                allocator.destroy(tz);
+            },
+        }
+        self.* = undefined;
+    }
+
     /// Creates a timezone borrowing `tz`, which must outlive every use.
     pub fn fromTz(tz: *const std.Tz) TimeZoneError!TimeZone {
         if (tz.timetypes.len == 0) return error.InvalidTzif;
-        for (tz.timetypes) |time_type| {
-            if (time_type.offset == std.math.minInt(i32)) return error.InvalidTzif;
-        }
-        const type_start = @intFromPtr(tz.timetypes.ptr);
-        const type_size = @sizeOf(std.tz.Timetype);
-        const type_end = type_start + type_size * tz.timetypes.len;
-        for (tz.transitions) |transition| {
-            const address = @intFromPtr(transition.timetype);
-            if (address < type_start or address >= type_end or (address - type_start) % type_size != 0)
-                return error.InvalidTzif;
-        }
+        // `std.Tz.parse` does not check the order binary searches rely on.
         if (tz.transitions.len > 1) {
             for (tz.transitions[1..], tz.transitions[0 .. tz.transitions.len - 1]) |current, previous| {
                 if (current.ts <= previous.ts) return error.InvalidTzif;
             }
-        }
-        for (tz.leapseconds, 0..) |leap, index| {
-            if (leap.occurrence < 0) return error.InvalidTzif;
-            if (index == 0) {
-                if (leap.correction != -1 and leap.correction != 1) return error.InvalidTzif;
-                continue;
-            }
-            const previous = tz.leapseconds[index - 1];
-            if (@as(i64, previous.occurrence) + 2_419_199 > leap.occurrence) return error.InvalidTzif;
-            const correction_delta = @as(i32, leap.correction) - previous.correction;
-            if (correction_delta != -1 and correction_delta != 1) return error.InvalidTzif;
         }
 
         var footer: ?PosixTimeZone = null;
         if (tz.footer) |source| {
             if (source.len > 0) footer = try PosixTimeZone.parse(source);
         }
-        if (tz.transitions.len > 0 and footer == null) return error.MissingFutureRule;
         if (tz.transitions.len > 0) {
-            const last = tz.transitions[tz.transitions.len - 1];
-            const unix_seconds = try unixTimeFromLeap(tz, last.ts);
-            if (try footer.?.offsetAt(unix_seconds) != last.timetype.offset)
-                return error.InvalidTzifFooter;
+            if (footer) |rule| {
+                const last = tz.transitions[tz.transitions.len - 1];
+                if (try rule.offsetAt(try unixTimeFromLeap(tz, last.ts)) != last.timetype.offset)
+                    return error.InvalidTzifFooter;
+            }
         }
 
         return .{ .value = .{ .tzif = .{ .tz = tz, .footer = footer } } };
@@ -100,24 +124,39 @@ pub const TimeZone = struct {
                         zone.tz.timetypes[0].offset;
                 }
                 const transition_time = try unixLeapTime(zone.tz, unix_seconds);
-                if (transition_time < transitions[0].ts) break :tzif zone.tz.timetypes[0].offset;
-                if (transition_time >= transitions[transitions.len - 1].ts)
-                    break :tzif try zone.footer.?.offsetAt(unix_seconds);
-
-                var low: usize = 0;
-                var high: usize = transitions.len;
-                while (low < high) {
-                    const middle = low + (high - low) / 2;
-                    if (transitions[middle].ts <= transition_time)
-                        low = middle + 1
-                    else
-                        high = middle;
-                }
-                break :tzif transitions[low - 1].timetype.offset;
+                const index = std.sort.partitionPoint(std.tz.Transition, transitions, transition_time, startsBy);
+                if (index == 0) break :tzif zone.tz.timetypes[0].offset;
+                // Without a footer, the last recorded type stays in force.
+                if (index == transitions.len) if (zone.footer) |footer|
+                    break :tzif try footer.offsetAt(unix_seconds);
+                break :tzif transitions[index - 1].timetype.offset;
             },
         };
     }
+
+    /// The first instant after `unix_seconds` at which the UTC offset may
+    /// change, or `null` when it never changes again.
+    pub fn nextTransition(self: TimeZone, unix_seconds: i64) TimeZoneError!?i64 {
+        const zone = switch (self.value) {
+            .fixed => return null,
+            .tzif => |zone| zone,
+        };
+        const transitions = zone.tz.transitions;
+        const index = std.sort.partitionPoint(
+            std.tz.Transition,
+            transitions,
+            try unixLeapTime(zone.tz, unix_seconds),
+            startsBy,
+        );
+        if (index < transitions.len) return try unixTimeFromLeap(zone.tz, transitions[index].ts);
+        const footer = zone.footer orelse return null;
+        return footer.nextTransition(unix_seconds);
+    }
 };
+
+fn startsBy(leap_time: i64, transition: std.tz.Transition) bool {
+    return transition.ts <= leap_time;
+}
 
 fn unixLeapTime(tz: *const std.Tz, unix_seconds: i64) TimeZoneError!i64 {
     var correction: i64 = 0;
@@ -171,36 +210,38 @@ const PosixTimeZone = struct {
         return result;
     }
 
+    const RuleTransition = struct {
+        at: i64,
+        before: i32,
+        after: i32,
+    };
+
+    fn transitionsIn(self: PosixTimeZone, year: u16, daylight_offset: i32) [2]RuleTransition {
+        return .{
+            .{
+                .at = self.start.unix(year, self.standard_offset, self.standard_offset),
+                .before = self.standard_offset,
+                .after = daylight_offset,
+            },
+            .{
+                .at = self.end.unix(year, self.standard_offset, daylight_offset),
+                .before = daylight_offset,
+                .after = self.standard_offset,
+            },
+        };
+    }
+
     fn offsetAt(self: PosixTimeZone, unix_seconds: i64) TimeZoneError!i32 {
         const daylight_offset = self.daylight_offset orelse return self.standard_offset;
-        const year = (try calendar.civilFromUnix(unix_seconds, self.standard_offset)).year;
-        const RuleTransition = struct {
-            at: i64,
-            before: i32,
-            after: i32,
-        };
+        const year: u32 = (try calendar.civilFromUnix(unix_seconds, self.standard_offset)).year;
         var latest: ?RuleTransition = null;
         var earliest: ?RuleTransition = null;
 
-        const year_value: u32 = year;
         // Both rules for Y-1 may spill into Y, so retain Y-2 as prior state.
-        var rule_year: u32 = if (year_value > 2) year_value - 2 else 1;
-        const last_year: u32 = if (year_value < std.math.maxInt(u16)) year_value + 1 else year_value;
+        var rule_year: u32 = if (year > 2) year - 2 else 1;
+        const last_year: u32 = @min(year + 1, std.math.maxInt(u16));
         while (rule_year <= last_year) : (rule_year += 1) {
-            const candidate_year: u16 = @intCast(rule_year);
-            const transitions = [_]RuleTransition{
-                .{
-                    .at = self.start.unix(candidate_year, self.standard_offset, self.standard_offset),
-                    .before = self.standard_offset,
-                    .after = daylight_offset,
-                },
-                .{
-                    .at = self.end.unix(candidate_year, self.standard_offset, daylight_offset),
-                    .before = daylight_offset,
-                    .after = self.standard_offset,
-                },
-            };
-            for (transitions) |transition| {
+            for (self.transitionsIn(@intCast(rule_year), daylight_offset)) |transition| {
                 if (transition.at <= unix_seconds) {
                     if (latest == null or transition.at >= latest.?.at) latest = transition;
                 } else if (earliest == null or transition.at < earliest.?.at) {
@@ -209,6 +250,21 @@ const PosixTimeZone = struct {
             }
         }
         return if (latest) |transition| transition.after else earliest.?.before;
+    }
+
+    fn nextTransition(self: PosixTimeZone, unix_seconds: i64) TimeZoneError!?i64 {
+        const daylight_offset = self.daylight_offset orelse return null;
+        const year: u32 = (try calendar.civilFromUnix(unix_seconds, self.standard_offset)).year;
+        var earliest: ?i64 = null;
+        var rule_year: u32 = if (year > 1) year - 1 else 1;
+        const last_year: u32 = @min(year + 1, std.math.maxInt(u16));
+        while (rule_year <= last_year) : (rule_year += 1) {
+            for (self.transitionsIn(@intCast(rule_year), daylight_offset)) |transition| {
+                if (transition.at > unix_seconds and (earliest == null or transition.at < earliest.?))
+                    earliest = transition.at;
+            }
+        }
+        return earliest;
     }
 };
 
@@ -489,7 +545,10 @@ test "UTC, fixed offsets, and recorded TZif transitions convert calendar minutes
         .leapseconds = &.{},
         .footer = null,
     };
-    try std.testing.expectError(error.MissingFutureRule, TimeZone.fromTz(&truncated));
+    const last_type_forever = try TimeZone.fromTz(&truncated);
+    try std.testing.expectEqual(7_200, try last_type_forever.offsetAt(unixSeconds(2400, .jan, 1, 0, 0)));
+    try std.testing.expectEqual(null, try last_type_forever.nextTransition(7_200));
+    try std.testing.expectEqual(7_200, try last_type_forever.nextTransition(3_600));
 
     var unsorted_transitions = [_]std.tz.Transition{
         .{ .ts = 7_200, .timetype = &timetypes[0] },
@@ -503,19 +562,6 @@ test "UTC, fixed offsets, and recorded TZif transitions convert calendar minutes
         .footer = "UTC0",
     };
     try std.testing.expectError(error.InvalidTzif, TimeZone.fromTz(&unsorted));
-
-    const invalid_leaps = [_]std.tz.Leapsecond{
-        .{ .occurrence = 78_796_800, .correction = 1 },
-        .{ .occurrence = 78_796_799, .correction = 2 },
-    };
-    const invalid_leap_tz: std.Tz = .{
-        .allocator = std.testing.allocator,
-        .transitions = &.{},
-        .timetypes = &timetypes,
-        .leapseconds = &invalid_leaps,
-        .footer = "UTC0",
-    };
-    try std.testing.expectError(error.InvalidTzif, TimeZone.fromTz(&invalid_leap_tz));
 }
 
 test "TZif POSIX rules skip spring gaps and repeat fall wall minutes" {
@@ -566,5 +612,63 @@ test "TZif POSIX rules skip spring gaps and repeat fall wall minutes" {
     try std.testing.expectEqual(
         3_600,
         try cross_year.offsetAt(unixSeconds(2025, .dec, 31, 22, 0)),
+    );
+}
+
+test "POSIX rules give the next offset change" {
+    var timetypes = [_]std.tz.Timetype{
+        .{ .offset = 3_600, .flags = 0, .name_data = .{ 'C', 'E', 'T', 0, 0, 0 } },
+    };
+    const tz: std.Tz = .{
+        .allocator = std.testing.allocator,
+        .transitions = &.{},
+        .timetypes = &timetypes,
+        .leapseconds = &.{},
+        .footer = "CET-1CEST,M3.5.0,M10.5.0/3",
+    };
+    const paris = try TimeZone.fromTz(&tz);
+    const spring = unixSeconds(2026, .mar, 29, 1, 0);
+    const fall = unixSeconds(2026, .oct, 25, 1, 0);
+    try std.testing.expectEqual(spring, try paris.nextTransition(unixSeconds(2025, .dec, 31, 23, 0)));
+    try std.testing.expectEqual(fall, try paris.nextTransition(spring));
+    try std.testing.expectEqual(unixSeconds(2027, .mar, 28, 1, 0), try paris.nextTransition(fall));
+    try std.testing.expectEqual(null, try TimeZone.utc.nextTransition(0));
+}
+
+test "load reads the zoneinfo database or $TZDIR" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "", "/etc/localtime", "../etc/passwd", "Europe/../../etc/passwd" }) |name| {
+        try std.testing.expectError(error.InvalidTimeZoneName, TimeZone.load(io, allocator, null, name));
+    }
+
+    var paris = TimeZone.load(io, allocator, null, "Europe/Paris") catch |err| switch (err) {
+        error.FileNotFound => return error.SkipZigTest,
+        else => return err,
+    };
+    defer paris.deinit();
+    try std.testing.expectEqual(
+        try DateTime.init(2026, .jul, 1, 14, 0),
+        try paris.toLocal(unixSeconds(2026, .jul, 1, 12, 0)),
+    );
+
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    var directory_buffer: [64]u8 = undefined;
+    const directory = try std.fmt.bufPrint(&directory_buffer, "/tmp/libcron-zoneinfo-{x}", .{random});
+    try std.Io.Dir.cwd().createDirPath(io, directory);
+    defer std.Io.Dir.cwd().deleteTree(io, directory) catch {};
+    const copy_path = try std.fs.path.join(allocator, &.{ directory, "Test" });
+    defer allocator.free(copy_path);
+    try std.Io.Dir.copyFileAbsolute(default_zoneinfo ++ "/Asia/Tokyo", copy_path, io, .{});
+
+    var environ = std.process.Environ.Map.init(allocator);
+    defer environ.deinit();
+    try environ.put("TZDIR", directory);
+    var tokyo = try TimeZone.load(io, allocator, &environ, "Test");
+    defer tokyo.deinit();
+    try std.testing.expectEqual(
+        try DateTime.init(2026, .jul, 1, 21, 0),
+        try tokyo.toLocal(unixSeconds(2026, .jul, 1, 12, 0)),
     );
 }

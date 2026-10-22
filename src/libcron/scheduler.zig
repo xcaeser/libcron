@@ -14,7 +14,7 @@ const JobOptions = job_module.JobOptions;
 const Observer = job_module.Observer;
 const Outcome = job_module.Outcome;
 const Task = job_module.Task;
-const max_catch_up_minutes = job_module.max_catch_up_minutes;
+const max_catch_up_minutes = @import("wall_clock.zig").max_catch_up_minutes;
 const report = job_module.report;
 
 pub const AddError = std.mem.Allocator.Error || error{
@@ -32,7 +32,7 @@ pub const RunError = std.Io.Cancelable || error{
 /// after `run` has returned.
 pub const Scheduler = struct {
     allocator: std.mem.Allocator,
-    /// Guards every field below, and each job's `wall_time` and `paused`.
+    /// Guards every field below, and each job's `wall` and `paused`.
     mutex: std.Io.Mutex,
     /// Ordered by id. Each job is allocated on its own so running
     /// invocations keep a valid pointer after it is removed.
@@ -130,7 +130,7 @@ pub const Scheduler = struct {
         const index = self.indexOf(id) orelse return false;
         const job = self.jobs.items[index];
         job.paused = false;
-        job.wall_time = null;
+        job.wall = .{};
         return true;
     }
 
@@ -142,7 +142,7 @@ pub const Scheduler = struct {
             if (self.running) return error.AlreadyRunning;
             self.running = true;
             // Minutes that passed while stopped are not caught up.
-            for (self.jobs.items) |job| job.wall_time = null;
+            for (self.jobs.items) |job| job.wall = .{};
         }
         defer {
             self.mutex.lockUncancelable(io);
@@ -208,7 +208,7 @@ pub const Scheduler = struct {
             cursor.* = @backingInt(job.id) + 1;
             if (job.paused) continue;
             const local_time = job.options.time_zone.toLocal(unix_seconds) catch continue;
-            if (!job.due(local_time)) continue;
+            if (!job.wall.due(job.expression, local_time)) continue;
             const invocation: Invocation = .{
                 .job_id = job.id,
                 .scheduled_unix_minute = unix_minute,

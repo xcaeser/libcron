@@ -10,6 +10,7 @@ const grammar = @import("libcron/parse.zig");
 const time_zone = @import("libcron/time_zone.zig");
 const job = @import("libcron/job.zig");
 const scheduler = @import("libcron/scheduler.zig");
+const wall_clock = @import("libcron/wall_clock.zig");
 
 pub const Month = calendar.Month;
 pub const DateTime = calendar.DateTime;
@@ -43,4 +44,5 @@ test {
     _ = time_zone;
     _ = job;
     _ = scheduler;
+    _ = wall_clock;
 }

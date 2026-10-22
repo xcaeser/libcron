@@ -3,6 +3,8 @@
 const std = @import("std");
 const calendar = @import("calendar.zig");
 const grammar = @import("parse.zig");
+const time_zone = @import("time_zone.zig");
+const wall_clock = @import("wall_clock.zig");
 
 const DateTime = calendar.DateTime;
 const DateTimeError = calendar.DateTimeError;
@@ -80,6 +82,15 @@ pub const Expression = struct {
             date_time = calendar.nextDay(date_time) orelse return null;
         }
         return null;
+    }
+
+    /// The first instant after `after_unix_seconds` at which a scheduler
+    /// running all along fires this expression in `zone`, following the same
+    /// DST rules: a fixed time skipped by spring-forward runs at the first
+    /// minute after the gap, and a repeated hour runs only jobs whose minute
+    /// or hour is `*`. `null` when that instant is past the year 65535.
+    pub fn nextInstant(self: Expression, after_unix_seconds: i64, zone: time_zone.TimeZone) ?i64 {
+        return wall_clock.nextInstant(self, after_unix_seconds, zone) catch null;
     }
 
     fn dayMatches(self: Expression, date_time: DateTime) bool {

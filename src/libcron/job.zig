@@ -5,6 +5,7 @@ const calendar = @import("calendar.zig");
 const command = @import("command.zig");
 const Expression = @import("expression.zig").Expression;
 const TimeZone = @import("time_zone.zig").TimeZone;
+const WallClock = @import("wall_clock.zig").WallClock;
 
 const DateTime = calendar.DateTime;
 
@@ -82,15 +83,8 @@ pub const Job = struct {
     /// once this is zero, so a removed job's last invocation completes.
     in_flight: std.atomic.Value(u32) = .init(0),
     paused: bool = false,
-    /// The latest wall-clock minute dispatched. It does not move back while
-    /// the wall clock repeats after a DST change.
-    wall_time: ?DateTime = null,
+    wall: WallClock = .{},
 
-    /// Applies cronie's rules for wall-clock steps. When the wall clock
-    /// repeats, only jobs with a `*` minute or hour run again. When it jumps
-    /// ahead by less than three hours (spring-forward, late wake), a
-    /// fixed-time job that matched any skipped minute runs once. Larger steps
-    /// either way are taken as the new time without catching up.
     /// Counts a new invocation, or returns false when the overlap policy
     /// skips it because one is still running.
     pub fn claim(self: *Job) bool {
@@ -103,26 +97,7 @@ pub const Job = struct {
     pub fn release(self: *Job) void {
         _ = self.in_flight.fetchSub(1, .release);
     }
-
-    pub fn due(self: *Job, local: DateTime) bool {
-        const expression = self.expression;
-        const matches = expression.matches(local) catch unreachable;
-        const previous = self.wall_time orelse {
-            self.wall_time = local;
-            return matches;
-        };
-        const step = calendar.epochMinute(local) - calendar.epochMinute(previous);
-        const wildcard = expression.minute_star or expression.hour_star;
-        if (step <= 0 and step > -max_catch_up_minutes) return wildcard and matches;
-
-        self.wall_time = local;
-        if (step == 1 or wildcard or @abs(step) >= max_catch_up_minutes) return matches;
-        const skipped = (expression.next(previous) catch unreachable) orelse return false;
-        return calendar.epochMinute(skipped) <= calendar.epochMinute(local);
-    }
 };
-
-pub const max_catch_up_minutes = 3 * 60;
 
 pub fn execute(
     job: *Job,
