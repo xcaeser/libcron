@@ -55,6 +55,9 @@ pub const JobOptions = struct {
     /// How long a canceled command's process group has between SIGTERM and
     /// SIGKILL.
     termination_grace: std.Io.Duration = .fromSeconds(10),
+    /// Whether `Scheduler.add` creates the job paused. `Scheduler.replace`
+    /// keeps the job's current state instead.
+    paused: bool = false,
 };
 
 /// What happened to one invocation. Durations are elapsed wall-clock time.
@@ -114,8 +117,11 @@ pub const Job = struct {
     /// Invocations started and not finished. The job's memory is freed only
     /// once this is zero, so a removed job's last invocation completes.
     in_flight: std.atomic.Value(u32) = .init(0),
-    paused: bool = false,
+    paused: bool,
     wall: WallClock = .{},
+    /// The instant the job's wall clock was last read, and what it read, so
+    /// `Scheduler.replace` can tell whether a new time zone agrees.
+    seen: ?struct { unix_seconds: i64, local: DateTime } = null,
 
     /// Counts a new invocation, or returns false when the overlap policy
     /// skips it because one is still running.
@@ -131,8 +137,12 @@ pub const Job = struct {
     }
 };
 
+/// Runs one invocation with the task and grace the job had when it was
+/// dispatched, so `Scheduler.replace` may change the job meanwhile.
 pub fn execute(
     job: *Job,
+    task: Task,
+    termination_grace: std.Io.Duration,
     io: std.Io,
     invocation: Invocation,
     observer: ?Observer,
@@ -141,7 +151,7 @@ pub fn execute(
     defer job.release();
     const started = std.Io.Clock.Timestamp.now(io, .boot);
 
-    switch (job.task) {
+    switch (task) {
         .callback => |callback| {
             callback.run(callback.context, io, invocation) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
@@ -154,7 +164,7 @@ pub fn execute(
             report(observer, invocation, .{ .callback_success = started.untilNow(io).raw });
         },
         .command => |spec| {
-            const term = command.run(spec, io, job.options.termination_grace) catch |err| {
+            const term = command.run(spec, io, termination_grace) catch |err| {
                 if (err == error.Canceled) return error.Canceled;
                 report(observer, invocation, .{ .command_error = err });
                 return;

@@ -39,6 +39,10 @@ pub const Scheduler = struct {
     jobs: std.ArrayList(*Job),
     /// Removed jobs whose last invocation has not finished yet.
     retired: std.ArrayList(*Job),
+    /// Command strings that `replace` swapped out while the job was running.
+    /// ponytail: freed once the job is idle; a `.concurrent` job that is
+    /// never idle keeps them until it is removed.
+    stale: std.ArrayList(Stale),
     next_id: u64,
     running: bool,
 
@@ -48,6 +52,7 @@ pub const Scheduler = struct {
             .mutex = .init,
             .jobs = .empty,
             .retired = .empty,
+            .stale = .empty,
             .next_id = 0,
             .running = false,
         };
@@ -59,6 +64,7 @@ pub const Scheduler = struct {
         for (self.retired.items) |job| self.destroy(job);
         self.jobs.deinit(self.allocator);
         self.retired.deinit(self.allocator);
+        self.stale.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -89,6 +95,7 @@ pub const Scheduler = struct {
             .task = task,
             .options = options,
             .arena = .init(self.allocator),
+            .paused = options.paused,
         };
         errdefer job.arena.deinit();
         if (task == .command) job.task = .{ .command = try command.dupe(task.command, job.arena.allocator()) };
@@ -96,6 +103,49 @@ pub const Scheduler = struct {
         self.jobs.appendAssumeCapacity(job);
         self.next_id += 1;
         return job.id;
+    }
+
+    /// Changes a job's schedule, task, and options in place and returns
+    /// whether it exists. The job keeps its id and its paused state
+    /// (`options.paused` is ignored). Running invocations finish with the old
+    /// task, and with `.skip` the job does not start again until they have;
+    /// an old callback context must stay valid until then. The job's DST
+    /// state carries over unless the new time zone reads a different local
+    /// time, so replacing a job inside a repeated hour does not rerun it.
+    pub fn replace(
+        self: *Scheduler,
+        io: std.Io,
+        id: JobId,
+        expression: Expression,
+        task: Task,
+        options: JobOptions,
+    ) AddError!bool {
+        if (task == .command) try task.command.validate();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const index = self.indexOf(id) orelse return false;
+        const job = self.jobs.items[index];
+
+        var arena: std.heap.ArenaAllocator = .init(self.allocator);
+        errdefer arena.deinit();
+        const owned_task: Task = if (task == .command)
+            .{ .command = try command.dupe(task.command, arena.allocator()) }
+        else
+            task;
+        if (job.in_flight.load(.acquire) == 0)
+            job.arena.deinit()
+        else
+            try self.stale.append(self.allocator, .{ .job = job, .arena = job.arena });
+
+        if (job.seen) |seen| {
+            const local = options.time_zone.toLocal(seen.unix_seconds) catch null;
+            if (local == null or !std.meta.eql(local.?, seen.local)) job.wall = .{};
+        }
+        job.expression = expression;
+        job.task = owned_task;
+        job.options = options;
+        job.arena = arena;
+        return true;
     }
 
     /// Removes a job and returns whether it existed. A running invocation
@@ -184,7 +234,7 @@ pub const Scheduler = struct {
             .claimed => |claimed| group.concurrent(
                 io,
                 job_module.execute,
-                .{ claimed.job, io, claimed.invocation, observer },
+                .{ claimed.job, claimed.task, claimed.termination_grace, io, claimed.invocation, observer },
             ) catch |err| {
                 claimed.job.release();
                 report(observer, claimed.invocation, .{ .dispatch_error = err });
@@ -194,7 +244,17 @@ pub const Scheduler = struct {
 
     const Due = union(enum) {
         skipped: Invocation,
-        claimed: struct { job: *Job, invocation: Invocation },
+        claimed: struct {
+            job: *Job,
+            task: Task,
+            termination_grace: std.Io.Duration,
+            invocation: Invocation,
+        },
+    };
+
+    const Stale = struct {
+        job: *Job,
+        arena: std.heap.ArenaAllocator,
     };
 
     /// Finds the first job with an id at or after `cursor` that is due, and
@@ -208,6 +268,7 @@ pub const Scheduler = struct {
             cursor.* = @backingInt(job.id) + 1;
             if (job.paused) continue;
             const local_time = job.options.time_zone.toLocal(unix_seconds) catch continue;
+            job.seen = .{ .unix_seconds = unix_seconds, .local = local_time };
             if (!job.wall.due(job.expression, local_time)) continue;
             const invocation: Invocation = .{
                 .job_id = job.id,
@@ -215,7 +276,12 @@ pub const Scheduler = struct {
                 .local_time = local_time,
             };
             if (!job.claim()) return .{ .skipped = invocation };
-            return .{ .claimed = .{ .job = job, .invocation = invocation } };
+            return .{ .claimed = .{
+                .job = job,
+                .task = job.task,
+                .termination_grace = job.options.termination_grace,
+                .invocation = invocation,
+            } };
         }
         return null;
     }
@@ -224,10 +290,17 @@ pub const Scheduler = struct {
         return @backingInt(job.id) < cursor;
     }
 
-    /// Frees removed jobs whose last invocation has finished.
+    /// Frees removed jobs and replaced command strings that no running
+    /// invocation uses anymore.
     fn sweep(self: *Scheduler, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
+        var stale_index: usize = 0;
+        while (stale_index < self.stale.items.len) {
+            if (self.stale.items[stale_index].job.in_flight.load(.acquire) == 0) {
+                self.stale.swapRemove(stale_index).arena.deinit();
+            } else stale_index += 1;
+        }
         var index: usize = 0;
         while (index < self.retired.items.len) {
             const job = self.retired.items[index];
@@ -245,6 +318,12 @@ pub const Scheduler = struct {
     }
 
     fn destroy(self: *Scheduler, job: *Job) void {
+        var index: usize = 0;
+        while (index < self.stale.items.len) {
+            if (self.stale.items[index].job == job) {
+                self.stale.swapRemove(index).arena.deinit();
+            } else index += 1;
+        }
         job.arena.deinit();
         self.allocator.destroy(job);
     }
@@ -767,4 +846,103 @@ test "jobs can be added, paused, unpaused, and removed while run is active" {
     try std.testing.expect(scheduler.pause(io, id));
     try std.testing.expect(scheduler.unpause(io, id));
     try std.testing.expect(scheduler.remove(io, id));
+}
+
+const ConcurrencyProbe = struct {
+    gate: std.Io.Event = .unset,
+    running: std.atomic.Value(u32) = .init(0),
+    peak: std.atomic.Value(u32) = .init(0),
+
+    fn run(context: ?*anyopaque, io: std.Io, _: Invocation) anyerror!void {
+        const self: *ConcurrencyProbe = @ptrCast(@alignCast(context.?));
+        _ = self.peak.fetchMax(self.running.fetchAdd(1, .monotonic) + 1, .monotonic);
+        defer _ = self.running.fetchSub(1, .monotonic);
+        try self.gate.wait(io);
+    }
+};
+
+test "a replaced skip job does not overlap its running invocation" {
+    const io = std.testing.io;
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    var probe: ConcurrencyProbe = .{};
+    const every_minute = try Expression.parse("* * * * *");
+    const task: Task = .{ .callback = .{ .context = &probe, .run = ConcurrencyProbe.run } };
+    const id = try scheduler.add(io, every_minute, task, .{});
+
+    var outcomes: TestOutcomes = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    scheduler.dispatchMinute(io, &group, 0, outcomes.observer());
+    try std.testing.expect(try scheduler.replace(io, id, try Expression.parse("*/2 * * * *"), task, .{}));
+    scheduler.dispatchMinute(io, &group, 2, outcomes.observer());
+    try std.testing.expectEqual(1, outcomes.skipped_overlap.load(.monotonic));
+    probe.gate.set(io);
+    try group.await(io);
+    try std.testing.expectEqual(1, probe.peak.load(.monotonic));
+    try std.testing.expectEqual(id, scheduler.jobs.items[0].id);
+    try std.testing.expect(!try scheduler.replace(io, @fromBackingInt(99), every_minute, task, .{}));
+}
+
+test "a replaced job keeps its paused state and its DST state" {
+    const io = std.testing.io;
+    const paris_tz = footerTz("CET-1CEST,M3.5.0,M10.5.0/3");
+    var clock = try TestClock.init("30 2 * * *", try TimeZone.fromTz(&paris_tz));
+    defer clock.deinit();
+    const id = clock.scheduler.jobs.items[0].id;
+    const fall = utcMinute(2026, .oct, 25, 1, 0);
+    try clock.dispatchRange(fall - 120, fall + 10);
+    try std.testing.expectEqual(1, clock.fired());
+
+    // A reload loads the same zone again: a different object, the same rules.
+    const reloaded_tz = footerTz("CET-1CEST,M3.5.0,M10.5.0/3");
+    const task: Task = .{ .callback = .{ .run = successfulTestCallback } };
+    try std.testing.expect(try clock.scheduler.replace(io, id, try Expression.parse("30 2 * * *"), task, .{
+        .time_zone = try TimeZone.fromTz(&reloaded_tz),
+    }));
+    try clock.dispatchRange(fall + 10, fall + 120);
+    try std.testing.expectEqual(1, clock.fired());
+
+    try std.testing.expect(clock.scheduler.pause(io, id));
+    try std.testing.expect(try clock.scheduler.replace(io, id, try Expression.parse("* * * * *"), task, .{}));
+    try clock.dispatch(fall + 121);
+    try std.testing.expectEqual(1, clock.fired());
+}
+
+test "replacing a job's time zone with one at another local time restarts its wall clock" {
+    var clock = try TestClock.init("0 11 * * *", .utc);
+    defer clock.deinit();
+    try clock.dispatchRange(utcMinute(2026, .jan, 1, 9, 50), utcMinute(2026, .jan, 1, 10, 1));
+    try std.testing.expect(try clock.scheduler.replace(
+        std.testing.io,
+        clock.scheduler.jobs.items[0].id,
+        try Expression.parse("0 11 * * *"),
+        .{ .callback = .{ .run = successfulTestCallback } },
+        .{ .time_zone = try TimeZone.fixedOffset(2 * 3_600) },
+    ));
+    // 10:01 UTC is 12:01 in the new zone; 11:00 there was never skipped.
+    try clock.dispatch(utcMinute(2026, .jan, 1, 10, 1));
+    try std.testing.expectEqual(0, clock.fired());
+}
+
+test "a job added paused does not run until unpaused" {
+    const io = std.testing.io;
+    var scheduler = Scheduler.init(std.testing.allocator);
+    defer scheduler.deinit();
+    const id = try scheduler.add(
+        io,
+        try Expression.parse("* * * * *"),
+        .{ .callback = .{ .run = successfulTestCallback } },
+        .{ .paused = true },
+    );
+    var outcomes: TestOutcomes = .{};
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    scheduler.dispatchMinute(io, &group, 0, outcomes.observer());
+    try group.await(io);
+    try std.testing.expectEqual(0, outcomes.callback_success.load(.monotonic));
+    try std.testing.expect(scheduler.unpause(io, id));
+    scheduler.dispatchMinute(io, &group, 1, outcomes.observer());
+    try group.await(io);
+    try std.testing.expectEqual(1, outcomes.callback_success.load(.monotonic));
 }
