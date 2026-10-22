@@ -11,6 +11,10 @@ pub const unix_socket_path_max = if (builtin.os.tag == .macos) 104 else Io.net.U
 
 pub const StatePaths = struct {
     allocator: Allocator,
+    /// `$CRONER_HOME`, or `~/.croner`.
+    home: []const u8,
+    /// Identifies the config: a hash of its absolute path.
+    key: []const u8,
     root: []const u8,
     socket: []const u8,
     lock: []const u8,
@@ -26,14 +30,13 @@ pub const StatePaths = struct {
             try std.fs.path.join(allocator, &.{ user_home, ".croner" })
         else
             return error.HomeNotFound;
-        defer allocator.free(home);
+        errdefer allocator.free(home);
         if (!std.fs.path.isAbsolute(home)) return error.CronerHomeNotAbsolute;
         const abs = try resolveFromCwd(allocator, io, config_path);
         defer allocator.free(abs);
-        const key = std.hash.Wyhash.hash(0, abs);
-        const key_text = try std.fmt.allocPrint(allocator, "{x}", .{key});
-        defer allocator.free(key_text);
-        const root = try std.fs.path.join(allocator, &.{ home, "run", key_text });
+        const key = try std.fmt.allocPrint(allocator, "{x}", .{std.hash.Wyhash.hash(0, abs)});
+        errdefer allocator.free(key);
+        const root = try std.fs.path.join(allocator, &.{ home, "run", key });
         errdefer allocator.free(root);
         const socket = try std.fs.path.join(allocator, &.{ root, "s" });
         errdefer allocator.free(socket);
@@ -43,10 +46,21 @@ pub const StatePaths = struct {
         const log = try std.fs.path.join(allocator, &.{ root, "croner.log" });
         errdefer allocator.free(log);
         const paused = try std.fs.path.join(allocator, &.{ root, "paused.json" });
-        return .{ .allocator = allocator, .root = root, .socket = socket, .lock = lock, .log = log, .paused = paused };
+        return .{
+            .allocator = allocator,
+            .home = home,
+            .key = key,
+            .root = root,
+            .socket = socket,
+            .lock = lock,
+            .log = log,
+            .paused = paused,
+        };
     }
 
     pub fn deinit(self: *StatePaths) void {
+        self.allocator.free(self.home);
+        self.allocator.free(self.key);
         self.allocator.free(self.root);
         self.allocator.free(self.socket);
         self.allocator.free(self.lock);
@@ -69,6 +83,23 @@ pub fn acquireStateLock(io: Io, state: *const StatePaths) !Io.File {
         .lock_nonblocking = true,
         .permissions = .fromMode(0o600),
     });
+}
+
+/// Waits until no daemon holds the state lock, so a successor can take it.
+pub fn waitForUnlock(io: Io, state: *const StatePaths) !void {
+    for (0..200) |_| {
+        const lock = acquireStateLock(io, state) catch |err| switch (err) {
+            error.WouldBlock => {
+                try Io.sleep(io, .fromMilliseconds(25), .awake);
+                continue;
+            },
+            error.FileNotFound => return,
+            else => return err,
+        };
+        lock.close(io);
+        return;
+    }
+    return error.Timeout;
 }
 
 /// Reads the ids of paused jobs; a missing file means none are paused.

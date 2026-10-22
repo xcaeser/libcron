@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
 
 const zli = @import("zli");
 
@@ -16,6 +17,7 @@ const Status = protocol.Status;
 const state_paths = @import("state.zig");
 const StatePaths = state_paths.StatePaths;
 const log = @import("log.zig");
+const supervisor = @import("supervisor.zig");
 
 pub const App = struct {
     allocator: Allocator,
@@ -196,6 +198,18 @@ fn startBackground(ctx: zli.CommandContext) !void {
     var state = try openState(ctx, absolute);
     defer state.deinit();
     if (try protocol.daemonSocketAvailable(app.io, &state)) return fail(ctx, "croner is already running for {s}", .{config_path});
+    var unit = try openUnit(ctx, &state);
+    defer unit.deinit();
+    if (try unit.installed(app.io)) {
+        // The service manager stays the daemon's parent, so it can restart it after a crash.
+        unit.start(app.allocator, app.io) catch |err| switch (err) {
+            error.ServiceManagerFailed => return fail(ctx, "{s} could not start {s}; run `croner enable` again", .{ supervisor.manager, unit.name }),
+            else => return err,
+        };
+        if (!try awaitDaemon(app.io, &state)) return fail(ctx, "the daemon did not answer within 5 seconds; see {s}", .{state.log});
+        try ctx.writer.print("started\nlog: {s}\n", .{state.log});
+        return;
+    }
 
     const executable = try std.process.executablePathAlloc(app.io, app.allocator);
     defer app.allocator.free(executable);
@@ -268,6 +282,88 @@ fn addCommand(root: *zli.Command, init: zli.InitOptions, name: []const u8, descr
     return command;
 }
 
+fn openUnit(ctx: zli.CommandContext, state: *const StatePaths) !supervisor.Unit {
+    const app = appFor(ctx);
+    return supervisor.Unit.init(app.allocator, app.environ, state.key) catch |err| switch (err) {
+        error.HomeNotFound => fail(ctx, "HOME is not set", .{}),
+        else => err,
+    };
+}
+
+/// Waits up to 5 seconds for the daemon to accept connections.
+fn awaitDaemon(io: Io, state: *const StatePaths) !bool {
+    for (0..200) |_| {
+        if (try protocol.daemonSocketAvailable(io, state)) return true;
+        try Io.sleep(io, .fromMilliseconds(25), .awake);
+    }
+    return false;
+}
+
+fn commandEnable(ctx: zli.CommandContext) !void {
+    const app = appFor(ctx);
+    const config_path = ctx.flag("config", []const u8);
+    const absolute = try config.resolveFromCwd(app.allocator, app.io, config_path);
+    defer app.allocator.free(absolute);
+    var specs = try loadConfigOrFail(ctx, absolute);
+    specs.deinit();
+    var state = try openState(ctx, absolute);
+    defer state.deinit();
+    // launchd opens the log before the daemon runs.
+    try state.ensure(app.io);
+    var unit = try openUnit(ctx, &state);
+    defer unit.deinit();
+    const executable = try supervisor.executablePath(app.allocator, app.io, state.home);
+    defer app.allocator.free(executable);
+    const text = try supervisor.render(app.allocator, .{
+        .name = unit.name,
+        .executable = executable,
+        .config_path = absolute,
+        .working_directory = std.fs.path.dirname(absolute) orelse "/",
+        .log_path = state.log,
+        .croner_home = state.home,
+        .path_env = app.environ.get("PATH"),
+    });
+    defer app.allocator.free(text);
+
+    unit.unload(app.allocator, app.io) catch |err| switch (err) {
+        error.FileNotFound => return fail(ctx, "{s} was not found; croner enable needs it", .{supervisor.manager}),
+        else => return err,
+    };
+    // A daemon started by `croner start` hands over to the service manager.
+    if (try protocol.daemonSocketAvailable(app.io, &state)) {
+        var response = try protocol.request(app.allocator, app.io, &state, .shutdown);
+        response.deinit();
+    }
+    state_paths.waitForUnlock(app.io, &state) catch |err| switch (err) {
+        error.Timeout => return fail(ctx, "the running daemon did not stop within 5 seconds", .{}),
+        else => return err,
+    };
+    unit.install(app.allocator, app.io, text) catch |err| switch (err) {
+        error.ServiceManagerFailed => return fail(ctx, "{s} could not load {s}; see its message above", .{ supervisor.manager, unit.path }),
+        else => return err,
+    };
+    if (!try awaitDaemon(app.io, &state))
+        return fail(ctx, "enabled {s}, but the daemon did not answer within 5 seconds; see {s}", .{ unit.path, state.log });
+    try ctx.writer.print("enabled {s}\nlog: {s}\n", .{ unit.path, state.log });
+    if (builtin.os.tag == .linux)
+        try ctx.writer.print("to keep jobs running while you are logged out: loginctl enable-linger\n", .{});
+}
+
+fn commandDisable(ctx: zli.CommandContext) !void {
+    const app = appFor(ctx);
+    const config_path = ctx.flag("config", []const u8);
+    var state = try openState(ctx, config_path);
+    defer state.deinit();
+    var unit = try openUnit(ctx, &state);
+    defer unit.deinit();
+    if (!try unit.installed(app.io)) {
+        try ctx.writer.print("croner is not enabled for {s}\n", .{config_path});
+        return;
+    }
+    try unit.remove(app.allocator, app.io);
+    try ctx.writer.print("disabled and stopped; removed {s}\n", .{unit.path});
+}
+
 pub fn buildCli(init: zli.InitOptions) !*zli.Command {
     const root = try zli.Command.init(init, .{
         .name = "croner",
@@ -290,6 +386,8 @@ pub fn buildCli(init: zli.InitOptions) !*zli.Command {
     try stop.addPositionalArg(.{ .name = "id", .description = "Job id", .required = false });
     _ = try addCommand(root, init, "list", "List configured jobs", commandList);
     _ = try addCommand(root, init, "reload", "Reload the configuration", commandReload);
+    _ = try addCommand(root, init, "enable", "Start the daemon at login and after a crash", commandEnable);
+    _ = try addCommand(root, init, "disable", "Undo enable and stop the daemon", commandDisable);
     _ = try addCommand(root, init, "version", "Print the version", commandVersion);
     const logs = try addCommand(root, init, "logs", "Show daemon logs", commandLogs);
     try logs.addFlag(.{ .name = "lines", .description = "Number of lines", .type = .Int, .default_value = .{ .Int = 100 } });

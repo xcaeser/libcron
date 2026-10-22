@@ -44,6 +44,7 @@ test {
     _ = @import("croner/state.zig");
     _ = @import("croner/protocol.zig");
     _ = @import("croner/log.zig");
+    _ = @import("croner/supervisor.zig");
     _ = @import("croner/daemon.zig");
     _ = serve;
     _ = commands;

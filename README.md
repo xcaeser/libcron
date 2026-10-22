@@ -128,9 +128,11 @@ To build from source, run `zig build`; the executable is written to
 | `croner list`       | Show jobs as `active`, `paused`, or `offline`.           |
 | `croner reload`     | Validate and reconcile the config by stable job ID.      |
 | `croner logs`       | Show the latest 100 combined log lines.                  |
+| `croner enable`     | Start the daemon at login and restart it after a crash.  |
+| `croner disable`    | Undo `enable` and stop the daemon.                       |
 | `croner version`    | Print the installed Croner version.                      |
 
-Each config gets its own daemon. Its socket, lock, and log live in
+Each config gets its own daemon. Its socket, lock, log, and pause state live in
 `~/.croner/run/<hash>/` (or `$CRONER_HOME/run/<hash>/`), where the hash is of
 the config's absolute path, so `--config` reaches the same daemon from any
 directory and the project directory stays clean.
@@ -140,6 +142,19 @@ untouched when validation fails. Unchanged jobs keep their runner; changed,
 removed, and new jobs are reconciled by ID. Pauses follow the job ID and are
 saved in the state directory, so paused jobs stay paused across reloads,
 daemon restarts, crashes, and reboots.
+
+### Run at login
+
+`croner enable` validates the config and registers its daemon with the user's
+service manager, never system-wide: a LaunchAgent in `~/Library/LaunchAgents`
+on macOS, a user unit in `~/.config/systemd/user` on Linux. The daemon then
+starts at login and is restarted after a crash, while `croner stop` still keeps
+it down until `croner start` or the next login; `croner start` goes through the
+service manager once a config is enabled. The unit records the config path,
+`CRONER_HOME`, and the current `PATH`, so jobs find the same programs; run
+`croner enable` again after changing them. On Linux, jobs stop when you log out
+unless you run `loginctl enable-linger`. Runs missed while the machine was off
+are not caught up.
 
 ### Configuration
 
