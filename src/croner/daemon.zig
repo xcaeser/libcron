@@ -46,7 +46,7 @@ const RuntimeJob = struct {
         };
         job.scheduler = libcron.Scheduler.init(allocator);
         errdefer job.scheduler.deinit();
-        _ = try job.scheduler.add(spec.expression, .{ .command = .{
+        _ = try job.scheduler.add(io, spec.expression, .{ .command = .{
             .argv = spec.argv,
             .cwd = .{ .path = spec.cwd },
             .environ_map = environ_map,
