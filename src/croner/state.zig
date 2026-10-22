@@ -22,7 +22,8 @@ pub const StatePaths = struct {
     paused: []const u8,
 
     /// State lives under `$CRONER_HOME` (default `~/.croner`), keyed by the
-    /// absolute config path so `--config` from any directory finds the daemon.
+    /// config's real path so `--config` from any directory, or through any
+    /// symlink, finds the one daemon for that file.
     pub fn init(allocator: Allocator, io: Io, environ: *const std.process.Environ.Map, config_path: []const u8) !StatePaths {
         const home = if (environ.get("CRONER_HOME")) |croner_home|
             try allocator.dupe(u8, croner_home)
@@ -32,9 +33,9 @@ pub const StatePaths = struct {
             return error.HomeNotFound;
         errdefer allocator.free(home);
         if (!std.fs.path.isAbsolute(home)) return error.CronerHomeNotAbsolute;
-        const abs = try resolveFromCwd(allocator, io, config_path);
-        defer allocator.free(abs);
-        const key = try std.fmt.allocPrint(allocator, "{x}", .{std.hash.Wyhash.hash(0, abs)});
+        const canonical = try realConfigPath(allocator, io, config_path);
+        defer allocator.free(canonical);
+        const key = try std.fmt.allocPrint(allocator, "{x}", .{std.hash.Wyhash.hash(0, canonical)});
         errdefer allocator.free(key);
         const root = try std.fs.path.join(allocator, &.{ home, "run", key });
         errdefer allocator.free(root);
@@ -75,6 +76,27 @@ pub const StatePaths = struct {
         try dir.setPermissions(io, .fromMode(0o700));
     }
 };
+
+/// The config file's real path, or its directory's real path joined with its
+/// name when the file is missing (deleted while its daemon runs, say).
+fn realConfigPath(allocator: Allocator, io: Io, config_path: []const u8) ![]u8 {
+    if (Io.Dir.cwd().realPathFileAlloc(io, config_path, allocator)) |real| {
+        defer allocator.free(real);
+        return allocator.dupe(u8, real);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+    const absolute = try resolveFromCwd(allocator, io, config_path);
+    defer allocator.free(absolute);
+    const dir = std.fs.path.dirname(absolute) orelse return allocator.dupe(u8, absolute);
+    const real_dir = Io.Dir.cwd().realPathFileAlloc(io, dir, allocator) catch |err| switch (err) {
+        error.FileNotFound => return allocator.dupe(u8, absolute),
+        else => return err,
+    };
+    defer allocator.free(real_dir);
+    return std.fs.path.join(allocator, &.{ real_dir, std.fs.path.basename(absolute) });
+}
 
 pub fn acquireStateLock(io: Io, state: *const StatePaths) !Io.File {
     return Io.Dir.createFileAbsolute(io, state.lock, .{
@@ -143,6 +165,40 @@ test "paused ids round trip through the state directory" {
     try std.testing.expectEqual(@as(usize, 2), loaded.value.len);
     try std.testing.expectEqualStrings("backup", loaded.value[0]);
     try std.testing.expectEqualStrings("id with \"quotes\"\n", loaded.value[1]);
+}
+
+fn testKey(environ: *const std.process.Environ.Map, dir: []const u8, name: []const u8) ![]u8 {
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, name });
+    defer std.testing.allocator.free(path);
+    var state = try StatePaths.init(std.testing.allocator, std.testing.io, environ, path);
+    defer state.deinit();
+    return std.testing.allocator.dupe(u8, state.key);
+}
+
+test "a config reached through a symlink shares its daemon state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "real");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "real/croner.json", .data = "{}" });
+    try tmp.dir.symLink(std.testing.io, "real", "link", .{ .is_directory = true });
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("CRONER_HOME", "/srv/croner");
+
+    const real = try testKey(&environ, dir, "real/croner.json");
+    defer std.testing.allocator.free(real);
+    const linked = try testKey(&environ, dir, "link/croner.json");
+    defer std.testing.allocator.free(linked);
+    try std.testing.expectEqualStrings(real, linked);
+
+    // A missing file is keyed through its directory's real path.
+    const real_missing = try testKey(&environ, dir, "real/missing.json");
+    defer std.testing.allocator.free(real_missing);
+    const linked_missing = try testKey(&environ, dir, "link/missing.json");
+    defer std.testing.allocator.free(linked_missing);
+    try std.testing.expectEqualStrings(real_missing, linked_missing);
 }
 
 test "state paths live in the croner home, keyed by absolute config path" {
