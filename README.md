@@ -108,7 +108,8 @@ running first fires at its next matching minute; a removed job's running
 invocation finishes and reports its outcome; an unpaused job does not catch up
 minutes it missed. `add` copies a command's argv, working directory, and
 environment, so they can be freed once it returns; a callback's context must
-stay valid until the job is removed or the scheduler is deinitialized. The
+stay valid until the job is removed and its last outcome reported, or the
+scheduler is deinitialized. The
 observer is called from the scheduler's and the jobs' tasks, so it must be
 thread-safe, but never with the scheduler locked, so it may add, remove,
 pause, or unpause jobs.

@@ -25,7 +25,9 @@
   `scheduled_unix_seconds`. `RunError` is `Canceled` or `AlreadyRunning`.
 - `Callback.init` and `Observer.init` take typed contexts, `Command.validate`
   runs the checks `add` makes, and `DateTime` formats with `{f}`.
-- `Expression.next` is several times faster.
+- `Expression.next` now takes under 50 ns for every schedule we measured: up
+  to 27 times faster for sparse ones such as `0 0 29 2 *`, and a few
+  nanoseconds (about 2x) slower for dense ones such as `* * * * *`.
 
 ### CLI
 
