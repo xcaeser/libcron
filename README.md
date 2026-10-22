@@ -53,7 +53,7 @@ exe.root_module.addImport("libcron", libcron_dep.module("libcron"));
 The archive contains the repository's CLI source as well. A consumer build
 only compiles `libcron`; Zig does not download individual files from a package.
 
-### `main.zig` example
+### Schedule a callback
 
 ```zig
 const std = @import("std");
@@ -65,87 +65,200 @@ const Backup = struct {
     fn run(context: ?*anyopaque, io: std.Io, invocation: libcron.Invocation) !void {
         _ = io;
         const self: *Backup = @ptrCast(@alignCast(context.?));
+        // `local_time` is the wall-clock minute the run is for.
         std.log.info("backing up {s} for {f}", .{ self.target, invocation.local_time });
     }
 };
 
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var scheduler = libcron.Scheduler.init(init.gpa);
+    defer scheduler.deinit();
+
+    // Parsing a literal at comptime fails the build on a typo.
+    const nightly = comptime libcron.Expression.parse("30 2 * * *") catch unreachable;
+    var backup: Backup = .{ .target = "/srv/data" };
+    // The scheduler keeps the context pointer, so `backup` must outlive the job.
+    _ = try scheduler.add(io, nightly, .{
+        .callback = .{ .context = &backup, .run = Backup.run },
+    }, .{}); // UTC, `.skip` overlap
+
+    // Blocks until canceled; outcomes go to an observer (none here).
+    try scheduler.run(io, null);
+}
+```
+
+### Run a command
+
+```zig
+const std = @import("std");
+const libcron = @import("libcron");
+
 const Log = struct {
     fn record(_: *Log, invocation: libcron.Invocation, outcome: libcron.Outcome) void {
+        // Prints e.g. `job 0: exited with code 0 after 1.5s`.
         std.log.info("job {d}: {f}", .{ @backingInt(invocation.job_id), outcome });
     }
 };
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    var paris = try libcron.TimeZone.load(io, init.gpa, init.environ_map, "Europe/Paris");
-    defer paris.deinit();
-
     var scheduler = libcron.Scheduler.init(init.gpa);
     defer scheduler.deinit();
 
-    var backup: Backup = .{ .target = "/srv/data" };
-    const nightly = comptime libcron.Expression.parse("30 2 * * *") catch unreachable;
-    _ = try scheduler.add(io, nightly, .{
-        .callback = .{ .context = &backup, .run = Backup.run },
-    }, .{ .time_zone = paris });
+    // argv runs directly, without a shell, and inherits stdout and stderr.
+    // `add` copies argv, cwd, and env, so they can be freed once it returns.
     _ = try scheduler.add(io, try .parse("@weekly"), .{
-        .command = .{ .argv = &.{ "/usr/bin/env", "rotate-logs" } },
-    }, .{});
+        .command = .{
+            .argv = &.{ "/usr/bin/env", "rotate-logs" },
+            .cwd = .{ .path = "/var/log" }, // default: inherit
+            .environ_map = init.environ_map, // default: inherit
+        },
+    }, .{
+        // Start every due run, even while the previous one is still going.
+        .overlap = .concurrent,
+        // On cancel: SIGTERM to the process group, SIGKILL 30s later.
+        .termination_grace = .fromSeconds(30),
+    });
 
+    // `Observer.init` keeps the context typed, so `record` needs no casts.
     var log: Log = .{};
     try scheduler.run(io, .init(&log, Log.record));
 }
 ```
 
-Parsing a literal at `comptime` with `catch unreachable` fails the build on a
-typo. For text from users, `Expression.parseWithDiagnostics` reports the
-failing field and a short message, such as `hour values must be within 0-23`.
-`Observer.init` takes a typed context pointer, so observers need no casts.
+Commands ignore stdin and run in their own process group, so a command that
+traps SIGTERM and its background children do not outlive the scheduler. The
+default grace is 10 seconds. With the default `.skip` overlap, a run that is
+due while the previous one is still active is reported as `skipped_overlap`.
 
-`Scheduler.run` blocks until canceled. Run it in its own task (for example
-with `io.concurrent`) to keep changing jobs: `add`, `replace`, `remove`,
-`pause`, and `unpause` work at any time, also while `run` is active. A job
-added while running first fires at its next matching minute, and
-`JobOptions.paused` adds it paused. `replace` changes a job in place: it keeps
-its id, its pause, and its running invocations, which finish with the old
-task, so a `.skip` job never overlaps its predecessor. A removed job's running
-invocation finishes and reports its outcome; an unpaused job does not catch up
-minutes it missed. `add` copies a command's argv, working directory, and
-environment, so they can be freed once it returns; a callback's context must
-stay valid until the job is removed and its last outcome reported, or the
-scheduler is deinitialized. The observer is called from the scheduler's and
-the jobs' tasks, so it must be thread-safe, but never with the scheduler
-locked, so it may add, replace, remove, pause, or unpause jobs.
+### Change jobs while running
 
-`run` dispatches every minute that starts on the real clock, including minutes
-repeated after the clock is set back, and each job reads it on the wall clock
-of its `TimeZone`:
+```zig
+const std = @import("std");
+const libcron = @import("libcron");
 
-- After the clock is set back, or in the repeated hour of a fall-back, a job
-  whose minute or hour field starts with `*` reruns on every matching minute,
-  while a fixed-time job waits until the wall clock passes the latest minute
-  it has handled, so it never runs twice.
-- After a jump ahead of up to and including three hours, such as a
-  spring-forward, a late wake, or the clock set ahead, each fixed-time match
-  in the skipped minutes runs once, with that minute as
-  `Invocation.local_time`, and the job's overlap policy decides whether those
-  runs pile up. Jobs starting with `*` run only for the current minute.
-- A jump of more than three hours either way is taken as the new time:
-  nothing is caught up or held back.
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    var scheduler = libcron.Scheduler.init(init.gpa);
+    defer scheduler.deinit();
+
+    // `run` blocks, so give it its own task and keep this one.
+    var running = try io.concurrent(libcron.Scheduler.run, .{ &scheduler, io, null });
+    // Cancel ends the loop; running commands get SIGTERM, then SIGKILL.
+    defer _ = running.cancel(io) catch {};
+
+    // A job added while running first fires at its next matching minute.
+    const sync = try scheduler.add(io, try .parse("*/5 * * * *"), .{
+        .command = .{ .argv = &.{"sync"} },
+    }, .{});
+
+    // A paused job skips its minutes and catches none of them up.
+    _ = scheduler.pause(io, sync);
+    _ = scheduler.unpause(io, sync);
+
+    // `replace` keeps the id and the pause; a run in progress finishes with the old task.
+    _ = try scheduler.replace(io, sync, try .parse("*/10 * * * *"), .{
+        .command = .{ .argv = &.{ "sync", "--quick" } },
+    }, .{});
+
+    // `.paused` adds a job that waits for `unpause`.
+    const report = try scheduler.add(io, try .parse("@hourly"), .{
+        .command = .{ .argv = &.{"report"} },
+    }, .{ .paused = true });
+    _ = scheduler.unpause(io, report);
+
+    // A removed job's run in progress finishes and reports; nothing new starts.
+    _ = scheduler.remove(io, sync);
+
+    // ... the rest of the program; the defer above stops the scheduler.
+    try io.sleep(.fromSeconds(60), .awake);
+}
+```
+
+`add`, `replace`, `remove`, `pause`, and `unpause` work from any task, also
+from the observer, which is called from the scheduler's and the jobs' tasks
+and so must be thread-safe. A callback's context must stay valid until the
+job is removed and its last outcome reported, or the scheduler is
+deinitialized.
+
+### Check an expression
+
+```zig
+const std = @import("std");
+const libcron = @import("libcron");
+
+/// Parses text a user typed and logs why it was rejected.
+fn parseSchedule(text: []const u8) !libcron.Expression {
+    var diagnostics: libcron.Diagnostics = .{};
+    return libcron.Expression.parseWithDiagnostics(text, &diagnostics) catch |err| {
+        // e.g. `ValueOutOfRange: hour values must be within 0-23`
+        std.log.err("{t}: {s}", .{ err, diagnostics.message });
+        return err;
+    };
+}
+
+pub fn main() !void {
+    const nightly = try parseSchedule("30 2 * * *");
+
+    // Minutes are timezone-neutral `DateTime`s and format as `2026-10-25 02:30`.
+    const at = try libcron.DateTime.init(2026, .oct, 25, 2, 30);
+    std.debug.assert(try nightly.matches(at));
+
+    // `next` is exclusive: the first match strictly after `at`.
+    if (try nightly.next(at)) |following| {
+        std.log.info("after {f} comes {f}", .{ at, following }); // 2026-10-26 02:30
+    }
+}
+```
+
+`Diagnostics.field` is `0` (minute) through `4` (day of week), or `null`
+when the expression as a whole is malformed.
+
+### Time zones and clock changes
+
+```zig
+const std = @import("std");
+const libcron = @import("libcron");
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    // Read from `$TZDIR`, else `/usr/share/zoneinfo`; must outlive its jobs.
+    var paris = try libcron.TimeZone.load(io, init.gpa, init.environ_map, "Europe/Paris");
+    defer paris.deinit();
+    // Fixed offsets and `.utc` (the default) need no cleanup.
+    const tokyo = try libcron.TimeZone.fixedOffset(9 * 60 * 60);
+
+    // When a scheduler running all along fires next, DST changes included.
+    const nightly = comptime libcron.Expression.parse("30 2 * * *") catch unreachable;
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    const fire = nightly.nextInstant(now, paris) orelse return error.NeverFires;
+    std.log.info("next at {f} in Paris, {f} UTC", .{
+        try paris.toLocal(fire),
+        try libcron.TimeZone.utc.toLocal(fire),
+    });
+
+    // Each job reads the schedule on its own wall clock.
+    var scheduler = libcron.Scheduler.init(init.gpa);
+    defer scheduler.deinit();
+    _ = try scheduler.add(io, nightly, .{ .command = .{ .argv = &.{"backup"} } }, .{ .time_zone = paris });
+    _ = try scheduler.add(io, nightly, .{ .command = .{ .argv = &.{"backup"} } }, .{ .time_zone = tokyo });
+    try scheduler.run(io, null);
+}
+```
+
+`run` dispatches every minute that starts on the real clock, including
+minutes repeated after the clock is set back, and each job reads it on the
+wall clock of its `TimeZone`:
+
+| Clock                                                           | `*` in the minute or hour field  | Fixed time, as in `30 2 * * *`                                                                      |
+| --------------------------------------------------------------- | -------------------------------- | --------------------------------------------------------------------------------------------------- |
+| Set back, or a repeated fall-back hour                          | Reruns on every matching minute  | Waits until the wall clock passes the latest minute it handled; never runs twice                    |
+| Ahead by up to 3 hours (spring-forward, a late wake, set ahead) | Runs for the current minute only | Each skipped match runs once, with that minute as `Invocation.local_time`, under the overlap policy |
+| More than 3 hours either way                                    | Taken as the new time            | Taken as the new time; nothing is caught up or held back                                            |
 
 A paused job keeps up with the clock, so unpausing it catches nothing up.
-`Expression.nextInstant` answers when a job next fires under these rules.
-
-Jobs default to `.skip` overlap behavior; use `.concurrent` to launch every
-due occurrence. Commands execute the supplied argv directly, without a shell,
-inherit stdout and stderr, ignore stdin, and run in their own process group.
-Canceling the scheduler sends SIGTERM to that group, then SIGKILL after
-`JobOptions.termination_grace` (10 seconds by default), so commands that trap
-SIGTERM and their background children do not outlive it.
-
-`DateTime` is a Gregorian calendar minute without an attached timezone and
-formats as `2026-10-25 02:30`. `Expression.next` is exclusive and returns
-`null` when no later representable match exists.
+`Expression.nextInstant` follows the same rules.
 
 ### API
 
