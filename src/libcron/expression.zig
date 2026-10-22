@@ -1,18 +1,11 @@
-//! Five-field cron expression parsing and calendar matching.
+//! Cron expressions matched against calendar minutes.
 
 const std = @import("std");
 const calendar = @import("calendar.zig");
+const grammar = @import("parse.zig");
 
 const DateTime = calendar.DateTime;
 const DateTimeError = calendar.DateTimeError;
-
-pub const ParseError = error{
-    InvalidFieldCount,
-    InvalidSyntax,
-    ValueOutOfRange,
-    InvalidRange,
-    InvalidStep,
-};
 
 /// A parsed five-field cron expression.
 pub const Expression = struct {
@@ -28,30 +21,17 @@ pub const Expression = struct {
     day_of_month_star: bool,
     day_of_week_star: bool,
 
-    /// Parses `minute hour day-of-month month day-of-week`.
-    pub fn parse(source: []const u8) ParseError!Expression {
-        var fields: [5][]const u8 = undefined;
-        var tokens = std.mem.tokenizeAny(u8, source, " \t");
-        for (&fields) |*field| field.* = tokens.next() orelse return error.InvalidFieldCount;
-        if (tokens.next() != null) return error.InvalidFieldCount;
+    /// Parses `minute hour day-of-month month day-of-week` or a macro such
+    /// as `@daily`; the grammar is described in `parse.zig`.
+    pub fn parse(source: []const u8) grammar.ParseError!Expression {
+        var diagnostics: grammar.Diagnostics = .{};
+        return grammar.parse(source, &diagnostics);
+    }
 
-        const minutes = try parseField(fields[0], 0, 59);
-        const hours = try parseField(fields[1], 0, 23);
-        const days_of_month = try parseField(fields[2], 1, 31);
-        const months = try parseField(fields[3], 1, 12);
-        const days_of_week = try parseField(fields[4], 0, 6);
-
-        return .{
-            .minutes = @intCast(minutes.mask),
-            .hours = @intCast(hours.mask),
-            .days_of_month = @intCast(days_of_month.mask),
-            .months = @intCast(months.mask),
-            .days_of_week = @intCast(days_of_week.mask),
-            .minute_star = minutes.star,
-            .hour_star = hours.star,
-            .day_of_month_star = days_of_month.star,
-            .day_of_week_star = days_of_week.star,
-        };
+    /// Like `parse`, and on failure fills `diagnostics` with the failing
+    /// field and a short explanation.
+    pub fn parseWithDiagnostics(source: []const u8, diagnostics: *grammar.Diagnostics) grammar.ParseError!Expression {
+        return grammar.parse(source, diagnostics);
     }
 
     /// Returns whether `date_time` matches this expression.
@@ -112,115 +92,8 @@ pub const Expression = struct {
     }
 };
 
-const ParsedField = struct {
-    mask: u64,
-    star: bool,
-};
-
-fn parseField(source: []const u8, minimum: u8, maximum: u8) ParseError!ParsedField {
-    if (source.len == 0) return error.InvalidSyntax;
-
-    if (source[0] == '*') {
-        if (source.len == 1) return .{ .mask = fullMask(minimum, maximum), .star = true };
-        if (source.len < 3 or source[1] != '/' or std.mem.indexOfScalar(u8, source[2..], '/') != null)
-            return error.InvalidSyntax;
-
-        const step = try parseStep(source[2..]);
-        return .{ .mask = steppedMask(minimum, maximum, step), .star = true };
-    }
-
-    var mask: u64 = 0;
-    var parts = std.mem.splitScalar(u8, source, ',');
-    while (parts.next()) |part| {
-        if (part.len == 0) return error.InvalidSyntax;
-
-        const slash = std.mem.indexOfScalar(u8, part, '/');
-        const base = if (slash) |index| part[0..index] else part;
-        const step = if (slash) |index| blk: {
-            if (std.mem.indexOfScalar(u8, part[index + 1 ..], '/') != null) return error.InvalidSyntax;
-            break :blk try parseStep(part[index + 1 ..]);
-        } else 1;
-
-        if (std.mem.indexOfScalar(u8, base, '-')) |dash| {
-            if (std.mem.indexOfScalar(u8, base[dash + 1 ..], '-') != null) return error.InvalidSyntax;
-            const start = try parseValue(base[0..dash], minimum, maximum);
-            const end = try parseValue(base[dash + 1 ..], minimum, maximum);
-            if (start > end) return error.InvalidRange;
-            mask |= steppedMask(start, end, step) << @intCast(start - minimum);
-        } else {
-            if (slash != null) return error.InvalidSyntax;
-            const value = try parseValue(base, minimum, maximum);
-            mask |= @as(u64, 1) << @intCast(value - minimum);
-        }
-    }
-
-    return .{ .mask = mask, .star = false };
-}
-
-fn parseValue(source: []const u8, minimum: u8, maximum: u8) ParseError!u8 {
-    for (source) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidSyntax;
-    const value = std.fmt.parseUnsigned(u16, source, 10) catch |err| switch (err) {
-        error.InvalidCharacter => return error.InvalidSyntax,
-        error.Overflow => return error.ValueOutOfRange,
-    };
-    if (value < minimum or value > maximum) return error.ValueOutOfRange;
-    return @intCast(value);
-}
-
-fn parseStep(source: []const u8) ParseError!u16 {
-    for (source) |byte| if (!std.ascii.isDigit(byte)) return error.InvalidSyntax;
-    const step = std.fmt.parseUnsigned(u16, source, 10) catch |err| switch (err) {
-        error.InvalidCharacter => return error.InvalidSyntax,
-        error.Overflow => return error.InvalidStep,
-    };
-    if (step == 0) return error.InvalidStep;
-    return step;
-}
-
-fn fullMask(minimum: u8, maximum: u8) u64 {
-    const width: u8 = maximum - minimum + 1;
-    return (@as(u64, 1) << @intCast(width)) - 1;
-}
-
-fn steppedMask(minimum: u8, maximum: u8, step: u16) u64 {
-    var mask: u64 = 0;
-    var value: u16 = minimum;
-    while (value <= maximum) {
-        mask |= @as(u64, 1) << @intCast(value - minimum);
-        if (maximum - value < step) break;
-        value += step;
-    }
-    return mask;
-}
-
 fn has(mask: anytype, value: anytype, minimum: u8) bool {
     return mask & (@as(@TypeOf(mask), 1) << @intCast(value - minimum)) != 0;
-}
-
-fn fuzzParse(_: void, smith: *std.testing.Smith) !void {
-    var buffer: [256]u8 = undefined;
-    const source = buffer[0..smith.slice(&buffer)];
-    if (Expression.parse(source)) |_| {} else |_| {}
-}
-
-test "expression parser tolerates arbitrary input" {
-    try std.testing.fuzz({}, fuzzParse, .{ .corpus = &.{
-        "* * * * *",
-    } });
-}
-
-test "parse five-field numeric syntax" {
-    const expression = try Expression.parse("*/15 8-12/2 * 1,3 1-5");
-    try std.testing.expect(try expression.matches(try DateTime.init(2026, .mar, 2, 10, 30)));
-    try std.testing.expect(!try expression.matches(try DateTime.init(2026, .mar, 2, 11, 30)));
-    try std.testing.expect(!try expression.matches(try DateTime.init(2026, .mar, 2, 10, 31)));
-
-    try std.testing.expectError(error.InvalidFieldCount, Expression.parse("* * * *"));
-    try std.testing.expectError(error.InvalidSyntax, Expression.parse("1/2 * * * *"));
-    try std.testing.expectError(error.InvalidSyntax, Expression.parse("1_0 * * * *"));
-    try std.testing.expectError(error.ValueOutOfRange, Expression.parse("60 * * * *"));
-    try std.testing.expectError(error.InvalidRange, Expression.parse("5-1 * * * *"));
-    try std.testing.expectError(error.InvalidStep, Expression.parse("*/0 * * * *"));
 }
 
 test "day fields use cron wildcard and OR semantics" {
@@ -253,14 +126,12 @@ test "next is exclusive and crosses calendar boundaries" {
     );
 }
 
-test "invalid dates and impossible schedules are reported" {
+test "invalid dates and the end of the calendar are reported" {
     const daily = try Expression.parse("0 0 * * *");
     const invalid: DateTime = .{ .year = 2026, .month = .feb, .day = 30, .hour = 0, .minute = 0 };
     try std.testing.expectError(error.InvalidDateTime, daily.matches(invalid));
     try std.testing.expectError(error.InvalidDateTime, daily.next(invalid));
 
-    const impossible = try Expression.parse("0 0 31 2 *");
-    try std.testing.expectEqual(null, try impossible.next(try DateTime.init(2026, .jan, 1, 0, 0)));
     try std.testing.expectEqual(null, try daily.next(try DateTime.init(std.math.maxInt(u16), .dec, 31, 23, 59)));
 }
 

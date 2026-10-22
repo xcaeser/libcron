@@ -6,6 +6,7 @@
 const calendar = @import("libcron/calendar.zig");
 const command = @import("libcron/command.zig");
 const expression = @import("libcron/expression.zig");
+const grammar = @import("libcron/parse.zig");
 const time_zone = @import("libcron/time_zone.zig");
 const scheduler = @import("libcron/scheduler.zig");
 
@@ -13,7 +14,8 @@ pub const Month = calendar.Month;
 pub const DateTime = calendar.DateTime;
 pub const DateTimeError = calendar.DateTimeError;
 
-pub const ParseError = expression.ParseError;
+pub const ParseError = grammar.ParseError;
+pub const Diagnostics = grammar.Diagnostics;
 pub const Expression = expression.Expression;
 
 pub const TimeZone = time_zone.TimeZone;
@@ -36,6 +38,7 @@ test {
     _ = calendar;
     _ = command;
     _ = expression;
+    _ = grammar;
     _ = time_zone;
     _ = scheduler;
 }
