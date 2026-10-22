@@ -25,12 +25,12 @@
   weekday names, Sunday as `0` or `7`, and `@daily`-style macros
 - Wildcards, lists, ranges, and steps, with POSIX day-of-month/day-of-week
   behavior
-- Compile-time checked expressions and field-level parse diagnostics
+- Field-level parse diagnostics
 - Matching, next-occurrence, and DST-aware next-instant calculation
 - In-memory callbacks and direct child-process scheduling through `std.Io`,
   with jobs added, removed, paused, and unpaused while running
 - UTC, fixed-offset, and TZif timezones loaded from the system database,
-  following cronie across DST changes
+  with defined behavior across DST changes and clock steps
 - A JSON-configured background daemon with per-job time zones that can run
   at login
 - No runtime dependencies for `libcron`
@@ -62,8 +62,9 @@ const libcron = @import("libcron");
 const Backup = struct {
     target: []const u8,
 
-    fn run(self: *Backup, io: std.Io, invocation: libcron.Invocation) !void {
+    fn run(context: ?*anyopaque, io: std.Io, invocation: libcron.Invocation) !void {
         _ = io;
+        const self: *Backup = @ptrCast(@alignCast(context.?));
         std.log.info("backing up {s} for {f}", .{ self.target, invocation.local_time });
     }
 };
@@ -83,8 +84,9 @@ pub fn main(init: std.process.Init) !void {
     defer scheduler.deinit();
 
     var backup: Backup = .{ .target = "/srv/data" };
-    _ = try scheduler.add(io, .comptimeParse("30 2 * * *"), .{
-        .callback = .init(&backup, Backup.run),
+    const nightly = comptime libcron.Expression.parse("30 2 * * *") catch unreachable;
+    _ = try scheduler.add(io, nightly, .{
+        .callback = .{ .context = &backup, .run = Backup.run },
     }, .{ .time_zone = paris });
     _ = try scheduler.add(io, try .parse("@weekly"), .{
         .command = .{ .argv = &.{ "/usr/bin/env", "rotate-logs" } },
@@ -95,34 +97,44 @@ pub fn main(init: std.process.Init) !void {
 }
 ```
 
-`Expression.comptimeParse` checks a literal at compile time; a typo fails the
-build with the reason, such as `hour values must be within 0-23`. For text
-from users, `Expression.parseWithDiagnostics` reports the failing field and a
-short message. `Callback.init` and `Observer.init` take a typed context
-pointer, so callbacks need no casts.
+Parsing a literal at `comptime` with `catch unreachable` fails the build on a
+typo. For text from users, `Expression.parseWithDiagnostics` reports the
+failing field and a short message, such as `hour values must be within 0-23`.
+`Observer.init` takes a typed context pointer, so observers need no casts.
 
 `Scheduler.run` blocks until canceled. Run it in its own task (for example
-with `io.concurrent`) to keep changing jobs: `add`, `remove`, `pause`, and
-`unpause` work at any time, also while `run` is active. A job added while
-running first fires at its next matching minute; a removed job's running
+with `io.concurrent`) to keep changing jobs: `add`, `replace`, `remove`,
+`pause`, and `unpause` work at any time, also while `run` is active. A job
+added while running first fires at its next matching minute, and
+`JobOptions.paused` adds it paused. `replace` changes a job in place: it keeps
+its id, its pause, and its running invocations, which finish with the old
+task, so a `.skip` job never overlaps its predecessor. A removed job's running
 invocation finishes and reports its outcome; an unpaused job does not catch up
 minutes it missed. `add` copies a command's argv, working directory, and
 environment, so they can be freed once it returns; a callback's context must
 stay valid until the job is removed and its last outcome reported, or the
-scheduler is deinitialized. The
-observer is called from the scheduler's and the jobs' tasks, so it must be
-thread-safe, but never with the scheduler locked, so it may add, remove,
-pause, or unpause jobs.
+scheduler is deinitialized. The observer is called from the scheduler's and
+the jobs' tasks, so it must be thread-safe, but never with the scheduler
+locked, so it may add, replace, remove, pause, or unpause jobs.
 
-Jobs follow the local time of their `TimeZone` the way cronie does. When the
-clock springs forward, a fixed-time job whose time was skipped runs once at
-the first minute after the gap. When the clock falls back, a fixed-time job
-runs only in the first pass of the repeated hour, while jobs whose minute or
-hour field starts with `*` run on every real matching minute. A late wake
-after a suspend runs fixed-time jobs skipped by less than three hours once;
-longer gaps are not caught up. A system clock stepped back by less than three
-hours never reruns a minute; a larger step is taken as the new time.
-`Expression.nextInstant` answers when a job will next fire under these rules.
+`run` dispatches every minute that starts on the real clock, including minutes
+repeated after the clock is set back, and each job reads it on the wall clock
+of its `TimeZone`:
+
+- After the clock is set back, or in the repeated hour of a fall-back, a job
+  whose minute or hour field starts with `*` reruns on every matching minute,
+  while a fixed-time job waits until the wall clock passes the latest minute
+  it has handled, so it never runs twice.
+- After a jump ahead of up to and including three hours, such as a
+  spring-forward, a late wake, or the clock set ahead, each fixed-time match
+  in the skipped minutes runs once, with that minute as
+  `Invocation.local_time`, and the job's overlap policy decides whether those
+  runs pile up. Jobs starting with `*` run only for the current minute.
+- A jump of more than three hours either way is taken as the new time:
+  nothing is caught up or held back.
+
+A paused job keeps up with the clock, so unpausing it catches nothing up.
+`Expression.nextInstant` answers when a job next fires under these rules.
 
 Jobs default to `.skip` overlap behavior; use `.concurrent` to launch every
 due occurrence. Commands execute the supplied argv directly, without a shell,
@@ -139,7 +151,6 @@ formats as `2026-10-25 02:30`. `Expression.next` is exclusive and returns
 
 - `Expression.parse(source) ParseError!Expression`
 - `Expression.parseWithDiagnostics(source, *Diagnostics) ParseError!Expression`
-- `Expression.comptimeParse(comptime source) Expression`
 - `expression.matches(date_time) !bool`
 - `expression.next(after) !?DateTime`
 - `expression.nextInstant(after_unix_seconds, time_zone) ?i64`
@@ -150,11 +161,13 @@ formats as `2026-10-25 02:30`. `Expression.next` is exclusive and returns
 - `time_zone.toLocal(unix_seconds) !DateTime`
 - `time_zone.nextTransition(unix_seconds) !?i64`
 - `Scheduler.init(allocator)` / `scheduler.deinit()`
-- `scheduler.add(io, expression, task, options) !JobId`
+- `scheduler.add(io, expression, task, options) !JobId`, paused when
+  `options.paused`
+- `scheduler.replace(io, id, expression, task, options) !bool`
 - `scheduler.remove(io, id) bool`
 - `scheduler.pause(io, id) bool` / `scheduler.unpause(io, id) bool`
 - `scheduler.run(io, observer) RunError!void`
-- `Callback.init(context, run)`, `Observer.init(context, notify)`
+- `Observer.init(context, notify)`
 - `command.validate() !void` — the checks `scheduler.add` runs on a command
 - `outcome.format`, `date_time.format` (use `{f}`)
 
