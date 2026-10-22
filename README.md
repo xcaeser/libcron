@@ -130,6 +130,11 @@ To build from source, run `zig build`; the executable is written to
 | `croner logs`       | Show the latest 100 combined log lines.                  |
 | `croner version`    | Print the installed Croner version.                      |
 
+Each config gets its own daemon. Its socket, lock, and log live in
+`~/.croner/run/<hash>/` (or `$CRONER_HOME/run/<hash>/`), where the hash is of
+the config's absolute path, so `--config` reaches the same daemon from any
+directory and the project directory stays clean.
+
 `logs` accepts `--lines <n>` and `--follow`. A reload leaves the daemon
 untouched when validation fails. Unchanged jobs retain their runner and pause
 state; changed, removed, and new jobs are reconciled by ID. Paused state is

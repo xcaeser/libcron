@@ -218,14 +218,23 @@ const StatePaths = struct {
     lock: []const u8,
     log: []const u8,
 
-    fn init(allocator: Allocator, io: Io, config_path: []const u8) !StatePaths {
+    /// State lives under `$CRONER_HOME` (default `~/.croner`), keyed by the
+    /// absolute config path so `--config` from any directory finds the daemon.
+    fn init(allocator: Allocator, io: Io, environ: *const std.process.Environ.Map, config_path: []const u8) !StatePaths {
+        const home = if (environ.get("CRONER_HOME")) |croner_home|
+            try allocator.dupe(u8, croner_home)
+        else if (environ.get("HOME")) |user_home|
+            try std.fs.path.join(allocator, &.{ user_home, ".croner" })
+        else
+            return error.HomeNotFound;
+        defer allocator.free(home);
+        if (!std.fs.path.isAbsolute(home)) return error.CronerHomeNotAbsolute;
         const abs = try resolveFromCwd(allocator, io, config_path);
         defer allocator.free(abs);
-        const dir = std.fs.path.dirname(abs) orelse return error.InvalidConfigPath;
         const key = std.hash.Wyhash.hash(0, abs);
         const key_text = try std.fmt.allocPrint(allocator, "{x}", .{key});
         defer allocator.free(key_text);
-        const root = try std.fs.path.join(allocator, &.{ dir, ".croner", key_text });
+        const root = try std.fs.path.join(allocator, &.{ home, "run", key_text });
         errdefer allocator.free(root);
         const socket = try std.fs.path.join(allocator, &.{ root, "s" });
         errdefer allocator.free(socket);
@@ -245,25 +254,9 @@ const StatePaths = struct {
     }
 
     fn ensure(self: *const StatePaths, io: Io) !void {
-        const cwd = Io.Dir.cwd();
-        _ = try cwd.createDirPathStatus(io, self.root, .fromMode(0o700));
-        const parent_path = std.fs.path.dirname(self.root) orelse return error.InvalidStatePath;
-        var parent = try Io.Dir.openDirAbsolute(io, parent_path, .{});
-        defer parent.close(io);
-        try parent.setPermissions(io, .fromMode(0o700));
-        var dir = try Io.Dir.openDirAbsolute(io, self.root, .{});
+        var dir = try Io.Dir.cwd().createDirPathOpen(io, self.root, .{ .permissions = .fromMode(0o700) });
         defer dir.close(io);
         try dir.setPermissions(io, .fromMode(0o700));
-        const ignore_path = try std.fs.path.join(self.allocator, &.{ std.fs.path.dirname(self.root) orelse ".", ".gitignore" });
-        defer self.allocator.free(ignore_path);
-        cwd.writeFile(io, .{
-            .sub_path = ignore_path,
-            .data = "*\n",
-            .flags = .{ .exclusive = true, .permissions = .fromMode(0o600) },
-        }) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
     }
 };
 
@@ -288,6 +281,7 @@ const Response = union(enum) {
 const App = struct {
     allocator: Allocator,
     io: Io,
+    environ: *const std.process.Environ.Map,
 };
 
 fn appFor(ctx: zli.CommandContext) *App {
@@ -363,7 +357,7 @@ fn commandStart(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
     const config_path = ctx.flag("config", []const u8);
     if (ctx.getArg("id")) |id| {
-        var state = try StatePaths.init(app.allocator, app.io, config_path);
+        var state = try StatePaths.init(app.allocator, app.io, app.environ, config_path);
         defer state.deinit();
         var response = try request(app.allocator, app.io, &state, .{ .start = id });
         defer response.deinit();
@@ -375,7 +369,7 @@ fn commandStart(ctx: zli.CommandContext) !void {
 fn commandStop(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
     const config_path = ctx.flag("config", []const u8);
-    var state = try StatePaths.init(app.allocator, app.io, config_path);
+    var state = try StatePaths.init(app.allocator, app.io, app.environ, config_path);
     defer state.deinit();
     const message: Request = if (ctx.getArg("id")) |id| .{ .stop = id } else .shutdown;
     var response = try request(app.allocator, app.io, &state, message);
@@ -385,7 +379,7 @@ fn commandStop(ctx: zli.CommandContext) !void {
 
 fn commandReload(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
-    var state = try StatePaths.init(app.allocator, app.io, ctx.flag("config", []const u8));
+    var state = try StatePaths.init(app.allocator, app.io, app.environ, ctx.flag("config", []const u8));
     defer state.deinit();
     var response = try request(app.allocator, app.io, &state, .reload);
     defer response.deinit();
@@ -395,7 +389,7 @@ fn commandReload(ctx: zli.CommandContext) !void {
 fn commandList(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
     const config_path = ctx.flag("config", []const u8);
-    var state = try StatePaths.init(app.allocator, app.io, config_path);
+    var state = try StatePaths.init(app.allocator, app.io, app.environ, config_path);
     defer state.deinit();
     var response = request(app.allocator, app.io, &state, .list) catch |err| switch (err) {
         error.ConnectionRefused, error.FileNotFound => return printOffline(ctx, app, config_path),
@@ -416,7 +410,7 @@ fn printOffline(ctx: zli.CommandContext, app: *App, config_path: []const u8) !vo
 
 fn commandLogs(ctx: zli.CommandContext) !void {
     const app = appFor(ctx);
-    var state = try StatePaths.init(app.allocator, app.io, ctx.flag("config", []const u8));
+    var state = try StatePaths.init(app.allocator, app.io, app.environ, ctx.flag("config", []const u8));
     defer state.deinit();
     const line_count = ctx.flag("lines", i32);
     if (line_count < 0) return error.InvalidLines;
@@ -436,7 +430,7 @@ fn startBackground(app: *App, config_path: []const u8, writer: *Io.Writer) !void
     const dir = std.fs.path.dirname(absolute) orelse ".";
     var specs = try loadConfig(app.allocator, app.io, absolute);
     specs.deinit();
-    var state = try StatePaths.init(app.allocator, app.io, absolute);
+    var state = try StatePaths.init(app.allocator, app.io, app.environ, absolute);
     defer state.deinit();
     try state.ensure(app.io);
     if (try daemonSocketAvailable(app.io, &state)) return error.AlreadyRunning;
@@ -652,7 +646,7 @@ fn serve(init: std.process.Init, config_path: []const u8) !void {
     signal_write_fd.store(fds[1], .release);
     defer signal_write_fd.store(-1, .release);
     installSignalHandlers();
-    var state = try StatePaths.init(init.gpa, init.io, config_path);
+    var state = try StatePaths.init(init.gpa, init.io, init.environ_map, config_path);
     defer state.deinit();
     try state.ensure(init.io);
     const state_lock = acquireStateLock(init.io, &state) catch |err| switch (err) {
@@ -708,7 +702,7 @@ pub fn main(init: std.process.Init) !void {
     defer cli.deinit();
     const arg_vector = try normalizedArgVector(init.arena.allocator(), args);
     var iterator = (std.process.Args{ .vector = arg_vector }).iterate();
-    var app: App = .{ .allocator = allocator, .io = init.io };
+    var app: App = .{ .allocator = allocator, .io = init.io, .environ = init.environ_map };
     cli.execute(&iterator, .{ .data = &app }) catch |err| {
         if (err != error.DaemonError)
             stdout_writer.interface.print("error: {s}\n", .{@errorName(err)}) catch {};
@@ -783,12 +777,28 @@ test "config flag may precede the subcommand" {
         try std.testing.expectEqualStrings(expected, std.mem.span(actual));
 }
 
-test "relative config path produces absolute state paths" {
-    var state = try StatePaths.init(std.testing.allocator, std.testing.io, "./croner.json");
-    defer state.deinit();
-    try std.testing.expect(std.fs.path.isAbsolute(state.root));
-    try std.testing.expect(std.fs.path.isAbsolute(state.socket));
-    try std.testing.expect(state.socket.len <= unix_socket_path_max);
+test "state paths live in the croner home, keyed by absolute config path" {
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("HOME", "/home/user");
+    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const absolute_config = try std.fs.path.join(std.testing.allocator, &.{ cwd, "croner.json" });
+    defer std.testing.allocator.free(absolute_config);
+
+    var relative = try StatePaths.init(std.testing.allocator, std.testing.io, &environ, "./croner.json");
+    defer relative.deinit();
+    var absolute = try StatePaths.init(std.testing.allocator, std.testing.io, &environ, absolute_config);
+    defer absolute.deinit();
+    try std.testing.expectEqualStrings(relative.socket, absolute.socket);
+    try std.testing.expect(std.mem.startsWith(u8, relative.root, "/home/user/.croner/run/"));
+
+    try environ.put("CRONER_HOME", "/srv/croner");
+    var custom = try StatePaths.init(std.testing.allocator, std.testing.io, &environ, absolute_config);
+    defer custom.deinit();
+    try std.testing.expect(std.mem.startsWith(u8, custom.root, "/srv/croner/run/"));
+    try environ.put("CRONER_HOME", "relative");
+    try std.testing.expectError(error.CronerHomeNotAbsolute, StatePaths.init(std.testing.allocator, std.testing.io, &environ, absolute_config));
 }
 
 test "protocol messages round trip and log tail selects requested lines" {
@@ -799,21 +809,21 @@ test "protocol messages round trip and log tail selects requested lines" {
     defer file.close(std.testing.io);
     try std.testing.expectEqual(@as(u64, 2), try tailOffset(file, std.testing.io, 6, 2));
 
-    const cwd = try std.process.currentPathAlloc(std.testing.io, std.testing.allocator);
-    defer std.testing.allocator.free(cwd);
-    const socket_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "protocol.sock" });
-    defer std.testing.allocator.free(socket_path);
+    // A short home keeps the socket path within the OS limit however deep the checkout is.
+    var random: [8]u8 = undefined;
+    std.testing.io.random(&random);
+    var home_buffer: [64]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buffer, "/tmp/croner-test-{x}", .{std.mem.readInt(u64, &random, .little)});
+    defer Io.Dir.cwd().deleteTree(std.testing.io, home) catch {};
+    var environ: std.process.Environ.Map = .init(std.testing.allocator);
+    defer environ.deinit();
+    try environ.put("CRONER_HOME", home);
+    var state = try StatePaths.init(std.testing.allocator, std.testing.io, &environ, "/project/croner.json");
+    defer state.deinit();
+    try state.ensure(std.testing.io);
+    const socket_path = state.socket;
     const address = try Io.net.UnixAddress.init(socket_path);
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "protocol.sock", .data = "stale" });
-    const lock_path = try std.fs.path.resolve(std.testing.allocator, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, "protocol.lock" });
-    defer std.testing.allocator.free(lock_path);
-    const state: StatePaths = .{
-        .allocator = std.testing.allocator,
-        .root = "",
-        .socket = socket_path,
-        .lock = lock_path,
-        .log = "",
-    };
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = socket_path, .data = "stale" });
     const state_lock = try acquireStateLock(std.testing.io, &state);
     defer state_lock.close(std.testing.io);
     try std.testing.expectError(error.WouldBlock, acquireStateLock(std.testing.io, &state));
