@@ -26,6 +26,7 @@ pub const JobJson = struct {
     schedule: []const u8,
     action: ActionJson,
     overlap: libcron.OverlapPolicy = .skip,
+    time_zone: ?[]const u8 = null,
 };
 
 pub const ConfigJson = struct {
@@ -44,9 +45,21 @@ pub const JobSpec = struct {
     cwd: []const u8,
     env: []const EnvPair,
     overlap: libcron.OverlapPolicy,
+    /// The IANA name as written; `null` means UTC.
+    time_zone_name: ?[]const u8,
+    /// Loaded into the spec's arena, so it lives exactly as long as the spec.
+    time_zone: libcron.TimeZone,
 
     /// On `error.InvalidConfig`, `problem` says which job and field are wrong.
-    pub fn init(gpa: Allocator, job: JobJson, config_dir: []const u8, problem: *Io.Writer) !JobSpec {
+    /// `environ` may point `TZDIR` at the zone database.
+    pub fn init(
+        gpa: Allocator,
+        io: Io,
+        environ: ?*const std.process.Environ.Map,
+        job: JobJson,
+        config_dir: []const u8,
+        problem: *Io.Writer,
+    ) !JobSpec {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -92,6 +105,26 @@ pub const JobSpec = struct {
                 return std.mem.order(u8, lhs.key, rhs.key) == .lt;
             }
         }.lessThan);
+        const time_zone_name = if (job.time_zone) |name| try a.dupe(u8, name) else null;
+        const time_zone: libcron.TimeZone = if (time_zone_name) |name|
+            libcron.TimeZone.load(io, a, environ, name) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.FileNotFound, error.InvalidTimeZoneName, error.IsDir, error.NotDir => {
+                    if (if (environ) |map| map.get("TZDIR") else null) |tzdir| return reject(
+                        problem,
+                        "job \"{s}\": time_zone \"{s}\" is not in the zone database at TZDIR ({s})",
+                        .{ job.id, name, tzdir },
+                    );
+                    return reject(
+                        problem,
+                        "job \"{s}\": time_zone \"{s}\" is not an IANA time zone name such as Europe/Paris",
+                        .{ job.id, name },
+                    );
+                },
+                else => return reject(problem, "job \"{s}\": time_zone \"{s}\" could not be loaded: {t}", .{ job.id, name, err }),
+            }
+        else
+            .utc;
         const id = try a.dupe(u8, job.id);
 
         return .{
@@ -103,6 +136,8 @@ pub const JobSpec = struct {
             .cwd = cwd,
             .env = env,
             .overlap = job.overlap,
+            .time_zone_name = time_zone_name,
+            .time_zone = time_zone,
         };
     }
 
@@ -115,6 +150,7 @@ pub const JobSpec = struct {
         if (!std.mem.eql(u8, lhs.schedule, rhs.schedule) or
             !std.mem.eql(u8, lhs.cwd, rhs.cwd) or lhs.overlap != rhs.overlap or
             lhs.argv.len != rhs.argv.len or lhs.env.len != rhs.env.len) return false;
+        if (!std.mem.eql(u8, lhs.time_zone_name orelse "", rhs.time_zone_name orelse "")) return false;
         for (lhs.argv, rhs.argv) |a, b| if (!std.mem.eql(u8, a, b)) return false;
         for (lhs.env, rhs.env) |a, b| {
             if (!std.mem.eql(u8, a.key, b.key) or !std.mem.eql(u8, a.value, b.value)) return false;
@@ -162,7 +198,14 @@ fn jsonProblem(err: anyerror) []const u8 {
     };
 }
 
-fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8, problem: *Io.Writer) !LoadedSpecs {
+fn parseConfig(
+    allocator: Allocator,
+    io: Io,
+    environ: ?*const std.process.Environ.Map,
+    bytes: []const u8,
+    config_dir: []const u8,
+    problem: *Io.Writer,
+) !LoadedSpecs {
     var scanner = std.json.Scanner.initCompleteInput(allocator, bytes);
     defer scanner.deinit();
     var diagnostics: std.json.Diagnostics = .{};
@@ -189,7 +232,7 @@ fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8, 
     for (parsed.value.jobs) |job| {
         if ((ids.getOrPutAssumeCapacity(job.id)).found_existing)
             return reject(problem, "job id \"{s}\" is used more than once", .{job.id});
-        var spec = try JobSpec.init(allocator, job, config_dir, problem);
+        var spec = try JobSpec.init(allocator, io, environ, job, config_dir, problem);
         errdefer spec.deinit();
         result.items.appendAssumeCapacity(spec.move());
     }
@@ -197,7 +240,13 @@ fn parseConfig(allocator: Allocator, bytes: []const u8, config_dir: []const u8, 
 }
 
 /// On `error.InvalidConfig`, `problem` holds a sentence naming the file and the fault.
-pub fn loadConfig(allocator: Allocator, io: Io, path: []const u8, problem: *Io.Writer) !LoadedSpecs {
+pub fn loadConfig(
+    allocator: Allocator,
+    io: Io,
+    environ: ?*const std.process.Environ.Map,
+    path: []const u8,
+    problem: *Io.Writer,
+) !LoadedSpecs {
     const bytes = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_config_bytes)) catch |err| switch (err) {
         error.FileNotFound => return reject(problem, "config file {s} not found; create one with `croner setup`", .{path}),
         error.StreamTooLong => return reject(problem, "config file {s} is larger than 1 MiB", .{path}),
@@ -205,7 +254,7 @@ pub fn loadConfig(allocator: Allocator, io: Io, path: []const u8, problem: *Io.W
     };
     defer allocator.free(bytes);
     problem.print("{s}: ", .{path}) catch {};
-    return parseConfig(allocator, bytes, std.fs.path.dirname(path) orelse ".", problem);
+    return parseConfig(allocator, io, environ, bytes, std.fs.path.dirname(path) orelse ".", problem);
 }
 
 pub fn resolveFromCwd(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
@@ -218,7 +267,7 @@ pub fn resolveFromCwd(allocator: Allocator, io: Io, path: []const u8) ![]u8 {
 fn expectProblem(expected: []const u8, config: []const u8) !void {
     var buffer: [512]u8 = undefined;
     var problem: Io.Writer = .fixed(&buffer);
-    try std.testing.expectError(error.InvalidConfig, parseConfig(std.testing.allocator, config, "/tmp", &problem));
+    try std.testing.expectError(error.InvalidConfig, parseConfig(std.testing.allocator, std.testing.io, null, config, "/tmp", &problem));
     try std.testing.expectEqualStrings(expected, problem.buffered());
 }
 
@@ -226,7 +275,7 @@ test "config parsing applies defaults and rejects invalid jobs" {
     var discard_buffer: [512]u8 = undefined;
     var discard: Io.Writer = .fixed(&discard_buffer);
     const valid = "{\"$schema\":\"./croner.schema.json\",\"jobs\":[{\"id\":\"sync\",\"schedule\":\"*/5 * * * *\",\"action\":{\"command\":{\"argv\":[\"echo\",\"\"],\"env\":{\"MODE\":\"test\"}}}}]}";
-    var parsed = try parseConfig(std.testing.allocator, valid, "/tmp", &discard);
+    var parsed = try parseConfig(std.testing.allocator, std.testing.io, null, valid, "/tmp", &discard);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.items.items.len);
     try std.testing.expectEqual(libcron.OverlapPolicy.skip, parsed.items.items[0].overlap);
@@ -240,7 +289,7 @@ test "config parsing applies defaults and rejects invalid jobs" {
     try expectProblem("job \"x\": env name \"BAD-NAME\" must be letters, digits and underscores, not starting with a digit", bad_env);
 
     const explicit = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"],\"cwd\":\"work\"}},\"overlap\":\"concurrent\"}]}";
-    var explicit_parsed = try parseConfig(std.testing.allocator, explicit, "/tmp", &discard);
+    var explicit_parsed = try parseConfig(std.testing.allocator, std.testing.io, null, explicit, "/tmp", &discard);
     defer explicit_parsed.deinit();
     try std.testing.expectEqual(libcron.OverlapPolicy.concurrent, explicit_parsed.items.items[0].overlap);
     try std.testing.expectEqualStrings("/tmp/work", explicit_parsed.items.items[0].cwd);
@@ -257,14 +306,30 @@ test "config parser rejects unknown fields and invalid schedules" {
     const one_job = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
     var discard_buffer: [512]u8 = undefined;
     var discard: Io.Writer = .fixed(&discard_buffer);
-    try std.testing.expectError(error.OutOfMemory, parseConfig(failing.allocator(), one_job, "/tmp", &discard));
+    try std.testing.expectError(error.OutOfMemory, parseConfig(failing.allocator(), std.testing.io, null, one_job, "/tmp", &discard));
+}
+
+test "time zones load by IANA name and unknown names are rejected" {
+    var discard_buffer: [512]u8 = undefined;
+    var discard: Io.Writer = .fixed(&discard_buffer);
+    const paris = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"0 9 * * *\",\"time_zone\":\"Europe/Paris\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
+    var parsed = try parseConfig(std.testing.allocator, std.testing.io, null, paris, "/tmp", &discard);
+    defer parsed.deinit();
+    // 2026-07-01T07:00:00Z is 09:00 in Paris summer time.
+    const local = try parsed.items.items[0].time_zone.toLocal(1782889200);
+    try std.testing.expectEqual(@as(u8, 9), local.hour);
+
+    try expectProblem(
+        "job \"x\": time_zone \"Mars/Olympus\" is not an IANA time zone name such as Europe/Paris",
+        "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"time_zone\":\"Mars/Olympus\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}",
+    );
 }
 
 test "job spec owns allocations made while it is initialized" {
     var discard_buffer: [512]u8 = undefined;
     var discard: Io.Writer = .fixed(&discard_buffer);
     var long_id: [8192]u8 = @splat('x');
-    var spec = try JobSpec.init(std.testing.allocator, .{
+    var spec = try JobSpec.init(std.testing.allocator, std.testing.io, null, .{
         .id = &long_id,
         .schedule = "* * * * *",
         .action = .{ .command = .{ .argv = &.{"true"} } },

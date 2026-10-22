@@ -69,7 +69,7 @@ pub const Daemon = struct {
             .running = .init(false),
         };
         errdefer result.deinit();
-        var specs = try config.loadConfig(allocator, io, result.config_path, problem);
+        var specs = try config.loadConfig(allocator, io, parent_env, result.config_path, problem);
         defer specs.deinit();
         var paused = state_paths.loadPaused(allocator, io, paused_path) catch |err| switch (err) {
             error.OutOfMemory => return err,
@@ -148,7 +148,7 @@ pub const Daemon = struct {
             .argv = spec.argv,
             .cwd = .{ .path = spec.cwd },
             .environ_map = if (environ) |*map| map else self.parent_env,
-        } }, .{ .overlap = spec.overlap });
+        } }, .{ .time_zone = spec.time_zone, .overlap = spec.overlap });
         self.names_mutex.lockUncancelable(self.io);
         defer self.names_mutex.unlock(self.io);
         self.names.putAssumeCapacity(job_id, name);
@@ -182,7 +182,7 @@ pub const Daemon = struct {
     /// removed, and a new one starts active. Replacements are added before
     /// anything is removed, so a failed reload leaves the daemon as it was.
     pub fn reload(self: *Daemon, problem: *Io.Writer) !void {
-        var specs = try config.loadConfig(self.allocator, self.io, self.config_path, problem);
+        var specs = try config.loadConfig(self.allocator, self.io, self.parent_env, self.config_path, problem);
         defer specs.deinit();
         const new_specs = specs.items.items;
         const Change = union(enum) {

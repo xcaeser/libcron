@@ -32,7 +32,12 @@
         "schedule": {
           "type": "string",
           "minLength": 1,
-          "description": "A five-field UTC cron expression."
+          "description": "A five-field cron expression or macro, read in the job's time_zone."
+        },
+        "time_zone": {
+          "type": "string",
+          "minLength": 1,
+          "description": "An IANA time zone name such as Europe/Paris. Defaults to UTC."
         },
         "action": {
           "$ref": "#/$defs/action"

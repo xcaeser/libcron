@@ -17,10 +17,12 @@ pub const Service = struct {
     config_path: []const u8,
     working_directory: []const u8,
     log_path: []const u8,
-    croner_home: []const u8,
-    /// The enabling shell's PATH, so jobs find the same programs at login.
-    path_env: ?[]const u8,
+    /// Variables the enabling shell had, such as PATH, so the daemon and its
+    /// jobs see the same programs, state directory and zone database at login.
+    environment: []const EnvVar,
 };
+
+pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
 /// A config's unit name and the file that defines it.
 pub const Unit = struct {
@@ -170,21 +172,18 @@ fn writePlist(writer: *Io.Writer, service: Service) Io.Writer.Error!void {
         \\  <string>{f}</string>
         \\  <key>EnvironmentVariables</key>
         \\  <dict>
-        \\    <key>CRONER_HOME</key>
-        \\    <string>{f}</string>
         \\
     , .{
         Xml{ .text = service.name },
         Xml{ .text = service.executable },
         Xml{ .text = service.config_path },
         Xml{ .text = service.working_directory },
-        Xml{ .text = service.croner_home },
     });
-    if (service.path_env) |path| try writer.print(
-        \\    <key>PATH</key>
+    for (service.environment) |variable| try writer.print(
+        \\    <key>{f}</key>
         \\    <string>{f}</string>
         \\
-    , .{Xml{ .text = path }});
+    , .{ Xml{ .text = variable.name }, Xml{ .text = variable.value } });
     try writer.print(
         \\  </dict>
         \\  <key>RunAtLoad</key>
@@ -212,17 +211,17 @@ fn writeSystemdUnit(writer: *Io.Writer, service: Service) Io.Writer.Error!void {
         \\[Service]
         \\ExecStart="{f}" _serve "{f}"
         \\WorkingDirectory={f}
-        \\Environment="CRONER_HOME={f}"
         \\
     , .{
         Systemd{ .text = service.config_path, .context = .plain },
         Systemd{ .text = service.executable, .context = .exec },
         Systemd{ .text = service.config_path, .context = .exec },
         Systemd{ .text = service.working_directory, .context = .plain },
-        Systemd{ .text = service.croner_home, .context = .quoted },
     });
-    if (service.path_env) |path|
-        try writer.print("Environment=\"PATH={f}\"\n", .{Systemd{ .text = path, .context = .quoted }});
+    for (service.environment) |variable| try writer.print("Environment=\"{f}={f}\"\n", .{
+        Systemd{ .text = variable.name, .context = .quoted },
+        Systemd{ .text = variable.value, .context = .quoted },
+    });
     try writer.writeAll(
         \\Restart=on-failure
         \\
@@ -267,8 +266,10 @@ const test_service: Service = .{
     .config_path = "/Users/me/R&D/100%/croner.json",
     .working_directory = "/Users/me/R&D/100%",
     .log_path = "/Users/me/.croner/run/1f/croner.log",
-    .croner_home = "/Users/me/.croner",
-    .path_env = "/opt/$bin:/usr/bin",
+    .environment = &.{
+        .{ .name = "CRONER_HOME", .value = "/Users/me/.croner" },
+        .{ .name = "PATH", .value = "/opt/$bin:/usr/bin" },
+    },
 };
 
 test "launchd plist runs the daemon at login and restarts it only after a crash" {

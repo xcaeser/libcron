@@ -49,7 +49,7 @@ fn loadConfigOrFail(ctx: zli.CommandContext, absolute_path: []const u8) !LoadedS
     const app = appFor(ctx);
     var problem_buffer: [1024]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    return config.loadConfig(app.allocator, app.io, absolute_path, &problem) catch |err| switch (err) {
+    return config.loadConfig(app.allocator, app.io, app.environ, absolute_path, &problem) catch |err| switch (err) {
         error.InvalidConfig => fail(ctx, "{s}", .{problem.buffered()}),
         else => err,
     };
@@ -111,7 +111,7 @@ fn commandSetup(ctx: zli.CommandContext) !void {
     const config_dir = std.fs.path.dirname(config_path) orelse ".";
     var problem_buffer: [1024]u8 = undefined;
     var problem: Io.Writer = .fixed(&problem_buffer);
-    var checked = JobSpec.init(app.allocator, job, config_dir, &problem) catch |err| switch (err) {
+    var checked = JobSpec.init(app.allocator, app.io, app.environ, job, config_dir, &problem) catch |err| switch (err) {
         error.InvalidConfig => return fail(ctx, "{s}", .{problem.buffered()}),
         else => return err,
     };
@@ -314,14 +314,20 @@ fn commandEnable(ctx: zli.CommandContext) !void {
     defer unit.deinit();
     const executable = try supervisor.executablePath(app.allocator, app.io, state.home);
     defer app.allocator.free(executable);
+    var environment: [3]supervisor.EnvVar = undefined;
+    environment[0] = .{ .name = "CRONER_HOME", .value = state.home };
+    var environment_len: usize = 1;
+    for ([_][]const u8{ "PATH", "TZDIR" }) |name| if (app.environ.get(name)) |value| {
+        environment[environment_len] = .{ .name = name, .value = value };
+        environment_len += 1;
+    };
     const text = try supervisor.render(app.allocator, .{
         .name = unit.name,
         .executable = executable,
         .config_path = absolute,
         .working_directory = std.fs.path.dirname(absolute) orelse "/",
         .log_path = state.log,
-        .croner_home = state.home,
-        .path_env = app.environ.get("PATH"),
+        .environment = environment[0..environment_len],
     });
     defer app.allocator.free(text);
 

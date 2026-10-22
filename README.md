@@ -81,7 +81,8 @@ pub fn main(init: std.process.Init) !void {
 
 `DateTime` is a Gregorian calendar minute without an attached timezone.
 `Expression.next` is exclusive and returns `null` when no later representable
-match exists. The managed CLI uses UTC.
+match exists. The CLI reads each job's schedule in its `time_zone`, UTC by
+default.
 
 Configure jobs before calling `Scheduler.run`; `add` and `remove` reject
 changes while it is active. Jobs default to `.skip` overlap behavior; use
@@ -153,8 +154,8 @@ on macOS, a user unit in `~/.config/systemd/user` on Linux. The daemon then
 starts at login and is restarted after a crash, while `croner stop` still keeps
 it down until `croner start` or the next login; `croner start` goes through the
 service manager once a config is enabled. The unit records the config path,
-`CRONER_HOME`, and the current `PATH`, so jobs find the same programs; run
-`croner enable` again after changing them. On Linux, jobs stop when you log out
+`CRONER_HOME`, and the current `PATH` and `TZDIR`, so jobs find the same
+programs and time zones; run `croner enable` again after changing them. On Linux, jobs stop when you log out
 unless you run `loginctl enable-linger`. Runs missed while the machine was off
 are not caught up.
 
@@ -179,7 +180,8 @@ The editor schema is published at
           }
         }
       },
-      "overlap": "skip"
+      "overlap": "skip",
+      "time_zone": "Europe/Paris"
     }
   ]
 }
@@ -191,10 +193,11 @@ an implicit shell. Use an executable shebang or an explicit argv such as
 `["bash", "script.sh"]` for shell scripts. `cwd` defaults to the config
 directory, and relative paths resolve from there. `env` overlays the daemon's
 inherited environment. `overlap` is `skip` or `concurrent` and defaults to
-`skip`. Unknown fields, malformed environment names, invalid schedules, and
-invalid commands are rejected before startup or reload, with a message that
-names the job and the field. `$schema` is editor metadata and may point
-anywhere.
+`skip`. `time_zone` is the IANA zone, such as `Europe/Paris`, the schedule is
+read in; it defaults to UTC. Unknown fields, malformed environment names,
+invalid schedules, unknown time zones, and invalid commands are rejected
+before startup or reload, with a message that names the job and the field.
+`$schema` is editor metadata and may point anywhere.
 
 ## Syntax
 
