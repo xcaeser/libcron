@@ -66,11 +66,10 @@ pub const JobSpec = struct {
         if (job.id.len == 0 or std.mem.indexOfScalar(u8, job.id, 0) != null)
             return reject(problem, "every job needs a nonempty id without NUL bytes", .{});
         const schedule = try a.dupe(u8, job.schedule);
-        const expression = libcron.Expression.parse(schedule) catch return reject(
-            problem,
-            "job \"{s}\": schedule \"{s}\" is not a cron expression (minute hour day-of-month month day-of-week)",
-            .{ job.id, job.schedule },
-        );
+        var diagnostics: libcron.Diagnostics = .{};
+        // The library's messages name the field, as in `hour values must be within 0-23`.
+        const expression = libcron.Expression.parseWithDiagnostics(schedule, &diagnostics) catch
+            return reject(problem, "job \"{s}\": schedule \"{s}\": {s}", .{ job.id, job.schedule, diagnostics.message });
         const command = job.action.command;
         const argv = try a.alloc([]const u8, command.argv.len);
         for (command.argv, argv) |arg, *copy| copy.* = try a.dupe(u8, arg);
@@ -298,7 +297,9 @@ test "config parsing applies defaults and rejects invalid jobs" {
 test "config parser rejects unknown fields and invalid schedules" {
     try expectProblem("line 2, column 8: unknown field", "{\"jobs\":[],\n\"extra\":true}");
     const invalid_schedule = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"not cron\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
-    try expectProblem("job \"x\": schedule \"not cron\" is not a cron expression (minute hour day-of-month month day-of-week)", invalid_schedule);
+    try expectProblem("job \"x\": schedule \"not cron\": expected five fields: minute hour day-of-month month day-of-week", invalid_schedule);
+    const out_of_range = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"0 25 * * *\",\"action\":{\"command\":{\"argv\":[\"x\"]}}}]}";
+    try expectProblem("job \"x\": schedule \"0 25 * * *\": hour values must be within 0-23", out_of_range);
     const empty_argv = "{\"jobs\":[{\"id\":\"x\",\"schedule\":\"* * * * *\",\"action\":{\"command\":{\"argv\":[]}}}]}";
     try expectProblem("job \"x\": action.command.argv needs a nonempty first element, and argv and cwd may not contain NUL bytes", empty_argv);
 
