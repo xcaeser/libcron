@@ -26,6 +26,13 @@ pub const DateTime = struct {
         return date_time;
     }
 
+    /// Formats as `2026-10-25 02:30`.
+    pub fn format(self: DateTime, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.print("{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}", .{
+            self.year, self.month.numeric(), self.day, self.hour, self.minute,
+        });
+    }
+
     pub fn validate(self: DateTime) DateTimeError!void {
         if (self.year == 0 or
             self.day == 0 or self.day > std.time.epoch.getDaysInMonth(self.year, self.month) or
@@ -129,4 +136,12 @@ pub fn nextDay(date_time: DateTime) ?DateTime {
     next.year += 1;
     next.month = .jan;
     return next;
+}
+
+test "date-times format for log lines" {
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "0987-03-09 04:05",
+        try std.fmt.bufPrint(&buffer, "{f}", .{try DateTime.init(987, .mar, 9, 4, 5)}),
+    );
 }

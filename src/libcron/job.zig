@@ -25,6 +25,21 @@ pub const Invocation = struct {
 pub const Callback = struct {
     context: ?*anyopaque = null,
     run: *const fn (?*anyopaque, std.Io, Invocation) anyerror!void,
+
+    /// Calls `run(context, io, invocation)` with `context` keeping its pointer
+    /// type, as in `.init(&backup, Backup.run)`.
+    pub fn init(context: anytype, comptime run: anytype) Callback {
+        const Context = @TypeOf(context);
+        return .{
+            .context = @ptrCast(@constCast(context)),
+            .run = struct {
+                fn call(erased: ?*anyopaque, io: std.Io, invocation: Invocation) anyerror!void {
+                    const typed: Context = @ptrCast(@alignCast(erased));
+                    return run(typed, io, invocation);
+                }
+            }.call,
+        };
+    }
 };
 
 pub const Task = union(enum) {
@@ -70,6 +85,21 @@ pub const Outcome = union(enum) {
 pub const Observer = struct {
     context: ?*anyopaque = null,
     notify: *const fn (?*anyopaque, Invocation, Outcome) void,
+
+    /// Calls `notify(context, invocation, outcome)` with `context` keeping its
+    /// pointer type, as in `.init(&log, Log.record)`.
+    pub fn init(context: anytype, comptime notify: anytype) Observer {
+        const Context = @TypeOf(context);
+        return .{
+            .context = @ptrCast(@constCast(context)),
+            .notify = struct {
+                fn call(erased: ?*anyopaque, invocation: Invocation, outcome: Outcome) void {
+                    const typed: Context = @ptrCast(@alignCast(erased));
+                    notify(typed, invocation, outcome);
+                }
+            }.call,
+        };
+    }
 };
 
 pub const Job = struct {
@@ -159,4 +189,31 @@ test "outcomes describe themselves for log lines" {
         var buffer: [128]u8 = undefined;
         try std.testing.expectEqualStrings(case.text, try std.fmt.bufPrint(&buffer, "{f}", .{case.outcome}));
     }
+}
+
+test "typed callbacks and observers receive their own context" {
+    const Counter = struct {
+        runs: u32 = 0,
+        outcomes: u32 = 0,
+
+        fn run(self: *@This(), _: std.Io, invocation: Invocation) !void {
+            self.runs += 1;
+            if (@backingInt(invocation.job_id) == 1) return error.Failed;
+        }
+
+        fn record(self: *@This(), _: Invocation, outcome: Outcome) void {
+            if (outcome == .callback_error) self.outcomes += 1;
+        }
+    };
+    var counter: Counter = .{};
+    const callback: Callback = .init(&counter, Counter.run);
+    const observer: Observer = .init(&counter, Counter.record);
+    const invocation: Invocation = .{
+        .job_id = @fromBackingInt(1),
+        .scheduled_unix_minute = 0,
+        .local_time = try DateTime.init(2026, .jan, 1, 0, 0),
+    };
+    try std.testing.expectError(error.Failed, callback.run(callback.context, std.testing.io, invocation));
+    observer.notify(observer.context, invocation, .{ .callback_error = .{ .err = error.Failed, .duration = .zero } });
+    try std.testing.expectEqual(Counter{ .runs = 1, .outcomes = 1 }, counter);
 }

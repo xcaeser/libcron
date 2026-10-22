@@ -30,6 +30,19 @@ pub const Expression = struct {
         return grammar.parse(source, &diagnostics);
     }
 
+    /// Parses `source` at compile time, so a malformed literal fails the build
+    /// with the reason.
+    pub fn comptimeParse(comptime source: []const u8) Expression {
+        return comptime parsed: {
+            @setEvalBranchQuota(100_000);
+            var diagnostics: grammar.Diagnostics = .{};
+            break :parsed grammar.parse(source, &diagnostics) catch |err| @compileError(std.fmt.comptimePrint(
+                "invalid cron expression \"{s}\": {s} ({t})",
+                .{ source, diagnostics.message, err },
+            ));
+        };
+    }
+
     /// Like `parse`, and on failure fills `diagnostics` with the failing
     /// field and a short explanation.
     pub fn parseWithDiagnostics(source: []const u8, diagnostics: *grammar.Diagnostics) grammar.ParseError!Expression {
@@ -194,4 +207,10 @@ test "next agrees with a minute-by-minute scan" {
             };
         }
     }
+}
+
+test "comptimeParse checks literals at compile time" {
+    const weekdays = comptime Expression.comptimeParse("*/15 9-17 * * MON-FRI");
+    try std.testing.expectEqual(try Expression.parse("*/15 9-17 * * 1-5"), weekdays);
+    try std.testing.expectEqual(try Expression.parse("@daily"), Expression.comptimeParse("@daily"));
 }
